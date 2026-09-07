@@ -1,0 +1,70 @@
+// Typed reads of JSON object members, and the in-place updates akibase's
+// json module lacks: replacing a member and merging one object into another.
+
+module wire::fields;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Json, Member, get, as_str, as_num, as_bool} from akibase::text::json;
+
+pub fn str_of<'a>(j: &'a Json, key: str): str<'a>? {
+  let v = get(j, key) else {
+    return none;
+  };
+  return as_str(v);
+}
+
+pub fn num_of(j: &Json, key: str): f64? {
+  let v = get(j, key) else {
+    return none;
+  };
+  return as_num(v);
+}
+
+pub fn bool_of(j: &Json, key: str): bool? {
+  let v = get(j, key) else {
+    return none;
+  };
+  return as_bool(v);
+}
+
+pub fn string_of(j: &Json, key: str): String => from_str(str_of(j, key) ?? "");
+
+// Sets key to value, replacing the member if there is one.
+pub fn put(var obj&: Json, key: str, value: Json): () {
+  match (obj) {
+    Json::Obj(var members&) => {
+      for (let i in 0usize..members.len()) {
+        if (members[i].key.as_str() == key) {
+          members.set(i, Member { key: from_str(key), value });
+          return;
+        }
+      }
+      members.push(Member { key: from_str(key), value });
+    }
+    _ => {}
+  }
+}
+
+// Puts every member of patch into obj.
+pub fn merge(var obj&: Json, patch: Json): () {
+  match (patch) {
+    Json::Obj(var members) => {
+      while (let m = members.pop()) {
+        put(obj, m.key.as_str(), m.value);
+      }
+    }
+    _ => {}
+  }
+}
+
+// A deep copy; akibase's Json has no clone.
+pub fn copy(j: &Json): Json => match (j) {
+  Json::Null => Json::Null,
+  Json::Bool(let b) => Json::Bool(b),
+  Json::Num(let n) => Json::Num(n),
+  Json::Str(let s&) => Json::Str(s.clone()),
+  Json::Arr(let items&) => Json::Arr(items.map(copy)),
+  Json::Obj(let members&) => Json::Obj(members.map(copy_member)),
+};
+
+fn copy_member(m&: Member): Member => Member { key: m.key.clone(), value: copy(m.value) };

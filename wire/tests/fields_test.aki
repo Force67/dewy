@@ -1,0 +1,27 @@
+module fields_test;
+
+import {parse, to_string, text} from akibase::text::json;
+import {eprintln} from akibase::logging;
+import {put, merge, str_of, num_of, copy} from wire::fields;
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  var e = parse("{\"id\":\"t1.a\",\"kind\":\"tool\",\"state\":\"running\"}")!;
+  merge(e, parse("{\"state\":\"ok\",\"output\":\"a.txt\"}")!);
+  check(to_string(e).as_str() == "{\"id\":\"t1.a\",\"kind\":\"tool\",\"state\":\"ok\",\"output\":\"a.txt\"}",
+        "merge replaces and appends", failures);
+  put(e, "kind", text("note"));
+  check((str_of(e, "kind") ?? "") == "note", "put replaces", failures);
+  check(num_of(e, "missing") == none, "a missing number", failures);
+  let c = copy(e);
+  put(e, "kind", text("agent"));
+  check((str_of(c, "kind") ?? "") == "note", "a copy is independent", failures);
+  return failures;
+}

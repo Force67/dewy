@@ -1,0 +1,102 @@
+// One JSON document per line over a TcpStream. Reads keep a partial line
+// across read timeouts, so a caller can poll with a short timeout and do
+// other work between lines.
+
+module wire::line_stream;
+
+import {String} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {TcpStream, NetError} from akibase::net::tcp;
+import {Json, parse, to_string} from akibase::text::json;
+import {utf8_lossy} from akibase::text::code_convert;
+
+// A peer may not send a line longer than this.
+comptime let kMaxLine: usize = 8 << 20;
+
+pub enum LinkError { Closed, Broken, TooLong }
+
+pub struct LineStream : Send {
+  var stream: TcpStream
+  var buf: Vector<u8>
+  // Where the unread bytes of buf start.
+  var head: usize
+
+  pub fn LineStream(stream: TcpStream): LineStream;
+  pub fn read(var self&): Json? ! LinkError;
+  pub fn send(var self&, j&: Json): () ! LinkError;
+  pub fn send_text(var self&, line: str): () ! LinkError;
+  fn take_line(var self&): String?;
+  fn compact(var self&): ();
+}
+
+fn LineStream::LineStream(stream: TcpStream): LineStream => LineStream { stream, buf: new::<u8>(), head: 0 };
+
+// The next complete line as JSON, or none when the read timed out first.
+// Lines that are not JSON are skipped.
+fn LineStream::read(var self&): Json? ! LinkError {
+  while (true) {
+    if (let line = self.take_line()) {
+      if (let j = parse(line.as_str())) {
+        return j;
+      }
+      continue;
+    }
+    if (#self.buf - self.head > kMaxLine) {
+      return fail LinkError::TooLong;
+    }
+    self.compact();
+    var chunk = [0u8; 16384];
+    let n = self.stream.read(chunk) else (let e) {
+      return match (e) {
+        NetError::TimedOut => none,
+        _ => fail LinkError::Broken
+      };
+    };
+    if (n == 0) {
+      return fail LinkError::Closed;
+    }
+    for (let i in 0usize..n) {
+      self.buf.push(chunk[i]);
+    }
+  }
+  return none;
+}
+
+fn LineStream::send(var self&, j&: Json): () ! LinkError {
+  let line = to_string(j);
+  return self.send_text(line.as_str());
+}
+
+// Sends a line that is already JSON text.
+fn LineStream::send_text(var self&, line: str): () ! LinkError {
+  var out = String();
+  out.push_str(line);
+  out.push_c8('\n');
+  if (let _ = self.stream.write_all(out.as_bytes())) {
+    return ();
+  }
+  return fail LinkError::Broken;
+}
+
+fn LineStream::take_line(var self&): String? {
+  for (let i in self.head..#self.buf) {
+    if (self.buf[i] == 10) {
+      let line = utf8_lossy(self.buf.as_slice()[self.head..i]);
+      self.head = i + 1;
+      return line;
+    }
+  }
+  return none;
+}
+
+fn LineStream::compact(var self&): () {
+  if (self.head == 0) {
+    return;
+  }
+  var rest = new::<u8>();
+  for (let i in self.head..#self.buf) {
+    rest.push(self.buf[i]);
+  }
+  self.buf = rest;
+  self.head = 0;
+}
