@@ -1,0 +1,23 @@
+module wire::clip;
+
+// The first line of s, at most max bytes long, never cut inside a UTF-8
+// sequence.
+pub fn first_line<'a>(s: str<'a>, max: usize): str<'a> {
+  var end: usize = 0;
+  while (end < #s && s[end] != '\n') {
+    end += 1;
+  }
+  return clip(s[..end], max);
+}
+
+// At most max bytes of s, never cut inside a UTF-8 sequence.
+pub fn clip<'a>(s: str<'a>, max: usize): str<'a> {
+  if (#s <= max) {
+    return s;
+  }
+  var end = max;
+  while (end > 0 && (s[end] as u8 & 0xC0) == 0x80) {
+    end -= 1;
+  }
+  return s[..end];
+}

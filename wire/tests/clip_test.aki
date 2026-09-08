@@ -1,0 +1,20 @@
+module clip_test;
+
+import {eprintln} from akibase::logging;
+import {clip, first_line} from wire::clip;
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  check(clip("hello", 10) == "hello", "short text stays", failures);
+  check(clip("hello", 3) == "hel", "long text is cut", failures);
+  check(clip("aä", 2) == "a", "no cut inside a sequence", failures);
+  check(first_line("one\ntwo", 10) == "one", "first line", failures);
+  return failures;
+}
