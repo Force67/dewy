@@ -1,0 +1,79 @@
+module board_test;
+
+import {String} from akibase::strings::base_string;
+import {contains} from akibase::strings::string_search;
+import {parse, to_string} from akibase::text::json;
+import {eprintln} from akibase::logging;
+import {str_of} from wire::fields;
+import {Board, Refusal, kStallMillis} from orchestrator::board;
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+fn task_state(b&: Board, id: str): String {
+  let t = b.task_json(id)!;
+  var out = String();
+  out.push_str(str_of(t, "state") ?? "");
+  return out;
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  var b = Board();
+  let hello = parse("{\"type\":\"hello\",\"box\":\"forge\",\"host\":\"forge.lan\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[]}")!;
+
+  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", 1000)) {
+    check(false, "an unknown box takes no task", failures);
+  } else (let e) {
+    check(e == Refusal::NoSuchBox, "unknown box", failures);
+  }
+
+  let _ = b.attach(hello, 1000);
+  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", 1000)) {
+    check(false, "an agent the box lacks is refused", failures);
+  }
+  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", 1000)!;
+  check(id.as_str() == "1", "ids count up", failures);
+
+  let out = b.take_outbox("forge");
+  check(out.len() == 1, "the turn waits in the outbox", failures);
+  let turn = parse(out[0].as_str())!;
+  check((str_of(turn, "type") ?? "") == "turn" && (str_of(turn, "turn") ?? "") == "t1", "a turn message", failures);
+  check(b.take_outbox("forge").len() == 0, "the outbox empties", failures);
+
+  let entry = parse("{\"type\":\"entry\",\"task\":\"1\",\"entry\":{\"id\":\"t1.x\",\"kind\":\"tool\",\"tool\":\"Bash\",\"detail\":\"npm test\",\"state\":\"running\"}}")!;
+  b.apply("forge", entry, 2000);
+  let state = b.state_json();
+  let summary = to_string(state);
+  check(contains(summary.as_str(), "\"activity\":\"Bash npm test\""), "a running tool is the activity", failures);
+
+  let done = parse("{\"type\":\"entry\",\"task\":\"1\",\"entry\":{\"id\":\"t1.x\",\"state\":\"ok\"}}")!;
+  b.apply("forge", done, 3000);
+  let t = b.task_json("1")!;
+  let text = to_string(t);
+  check(contains(text.as_str(), "\"tool\":\"Bash\",\"detail\":\"npm test\",\"state\":\"ok\""), "entries merge by id", failures);
+  check(contains(text.as_str(), "\"title\":\"fix the flaky test\""), "the title is the first line", failures);
+
+  b.sweep(3000 + kStallMillis + 1);
+  check(task_state(b, "1").as_str() == "stalled", "silence stalls a task", failures);
+  b.apply("forge", parse("{\"type\":\"entry\",\"task\":\"1\",\"entry\":{\"id\":\"t1.y\",\"kind\":\"agent\",\"text\":\"Done.\"}}")!, 500000);
+  check(task_state(b, "1").as_str() == "working", "news revives a stalled task", failures);
+
+  b.apply("forge", parse("{\"type\":\"state\",\"task\":\"1\",\"state\":\"idle\"}")!, 500001);
+  check(task_state(b, "1").as_str() == "idle", "a finished turn idles", failures);
+
+  let seq = b.last_seq();
+  let _ = b.steer("1", "now push", 600000);
+  let frames = b.frames_since(seq)!;
+  check(frames.len() >= 2, "steering emits the entry and the task", failures);
+
+  // A worker that comes back without the task running fails it.
+  b.detach("forge", 700000);
+  let _ = b.attach(hello, 700001);
+  check(task_state(b, "1").as_str() == "failed", "a lost turn fails", failures);
+  return failures;
+}

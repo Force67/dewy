@@ -1,0 +1,601 @@
+// Everything the orchestrator knows: the boxes, their tasks and each
+// task's thread of entries. Every change lands in a numbered feed that app
+// streams replay from, and commands for a box wait in its outbox until the
+// box's connection picks them up. No I/O happens here; callers pass the
+// time in.
+
+module orchestrator::board;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Deque} from akibase::containers::deque;
+import {Heap} from akibase::allocator::default_crt_alloc;
+import {Json, object, array, text, number, boolean, set, push, get, as_array, as_str, parse, to_string} from akibase::text::json;
+import {str_of, string_of, num_of, bool_of, merge, copy} from wire::fields;
+import {first_line} from wire::clip;
+import {trim} from akibase::strings::string_search;
+import {replace} from akibase::algorithm;
+
+// A task that says nothing for this long while working is stalled.
+pub comptime let kStallMillis: i64 = 180000;
+comptime let kFeedLength: usize = 4000;
+comptime let kPreviewBytes: usize = 200;
+
+pub enum TaskState { Working, Idle, Stalled, Failed, Stopped }
+
+pub fn state_name(s: TaskState): str<'static> => match (s) {
+  TaskState::Working => "working",
+  TaskState::Idle => "idle",
+  TaskState::Stalled => "stalled",
+  TaskState::Failed => "failed",
+  TaskState::Stopped => "stopped",
+};
+
+pub fn state_named(name: str): TaskState? => match (name) {
+  "working" => TaskState::Working,
+  "idle" => TaskState::Idle,
+  "stalled" => TaskState::Stalled,
+  "failed" => TaskState::Failed,
+  "stopped" => TaskState::Stopped,
+  _ => none,
+};
+
+// Why the board turned a request down.
+pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, Empty, UnknownAgent }
+
+pub fn refusal_message(r: Refusal): str<'static> => match (r) {
+  Refusal::NoSuchBox => "no such box",
+  Refusal::BoxOffline => "the box is offline",
+  Refusal::NoSuchTask => "no such task",
+  Refusal::Empty => "the message is empty",
+  Refusal::UnknownAgent => "the box has no such agent",
+};
+
+pub struct Task : Send {
+  pub var id: String
+  pub var box_name: String
+  pub var project: String
+  pub var agent: String
+  pub var title: String
+  pub var session: String
+  pub var preview: String
+  // What the agent is doing right now, such as "Bash npm test".
+  pub var activity: String
+  pub var state: TaskState
+  pub var archived: bool
+  pub var created: i64
+  pub var updated: i64
+  pub var turns: u32
+  // Entries as JSON text, since akibase's Json is not Send, and their ids.
+  pub var entries: Vector<String>
+  pub var entry_ids: Vector<String>
+}
+
+pub struct Box : Send {
+  pub var name: String
+  pub var host: String
+  pub var os: String
+  // JSON text: an array of agent names, an array of {name, path}, an object.
+  pub var agents: String
+  pub var projects: String
+  pub var stats: String
+  pub var online: bool
+  pub var last_seen: i64
+  // Lines for the box's worker, oldest first.
+  pub var outbox: Vector<String>
+}
+
+struct Change : Send {
+  pub let seq: u64
+  pub let frame: String
+}
+
+pub struct Board : Send {
+  var tasks: Vector<Task>
+  var boxes: Vector<Box>
+  var feed: Deque<Change>
+  var seq: u64
+  var next_id: u64
+  var dirty_tasks: Vector<String>
+  var dirty_boxes: bool
+
+  pub fn Board(): Board;
+  pub fn last_seq(self&): u64;
+  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, now: i64): String ! Refusal;
+  pub fn steer(var self&, id: str, prompt: str, now: i64): () ! Refusal;
+  pub fn stop(var self&, id: str, now: i64): () ! Refusal;
+  pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
+  pub fn attach(var self&, hello&: Json, now: i64): String;
+  pub fn detach(var self&, name: str, now: i64): ();
+  pub fn apply(var self&, box_name: str, msg&: Json, now: i64): ();
+  pub fn sweep(var self&, now: i64): ();
+  pub fn take_outbox(var self&, box_name: str): Vector<String>;
+  pub fn frames_since(self&, seq: u64): Vector<String>?;
+  pub fn take_dirty_tasks(var self&): Vector<String>;
+  pub fn take_dirty_boxes(var self&): bool;
+  pub fn state_json(self&): Json;
+  pub fn task_json(self&, id: str): Json?;
+  pub fn boxes_json(self&): Json;
+  pub fn restore_task(var self&, j&: Json): ();
+  pub fn restore_box(var self&, j&: Json): ();
+  fn find_task(self&, id: str): usize?;
+  fn find_box(self&, name: str): usize?;
+  fn send_turn(var self&, i: usize, prompt: str, now: i64): ();
+  fn put_entry(var self&, i: usize, entry: Json, now: i64): ();
+  fn set_state(var self&, i: usize, state: TaskState, now: i64): ();
+  fn emit(var self&, kind: str, data&: Json): ();
+  fn touch_task(var self&, i: usize): ();
+  fn touch_box(var self&, b: usize): ();
+}
+
+fn Board::Board(): Board => Board {
+  tasks: new::<Task>(), boxes: new::<Box>(), feed: Deque::<Change>(Heap {}), seq: 0, next_id: 1,
+  dirty_tasks: new::<String>(), dirty_boxes: false
+};
+
+fn Board::last_seq(self&): u64 => self.seq;
+
+fn Board::find_task(self&, id: str): usize? {
+  for (let i in 0usize..self.tasks.len()) {
+    if (self.tasks[i].id.as_str() == id) {
+      return i;
+    }
+  }
+  return none;
+}
+
+fn Board::find_box(self&, name: str): usize? {
+  for (let i in 0usize..self.boxes.len()) {
+    if (self.boxes[i].name.as_str() == name) {
+      return i;
+    }
+  }
+  return none;
+}
+
+fn has_text(list&: Json, value: str): bool {
+  let items = as_array(list) else {
+    return false;
+  };
+  for (let item& in items) {
+    if (let s = as_str(item)) {
+      if (s == value) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+fn listed(obj&: Json, key: str, value: str): bool {
+  let list = get(obj, key) else {
+    return false;
+  };
+  return has_text(list, value);
+}
+
+fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, now: i64): String ! Refusal {
+  let b = self.find_box(box_name) else {
+    return fail Refusal::NoSuchBox;
+  };
+  if (!self.boxes[b].online) {
+    return fail Refusal::BoxOffline;
+  }
+  if (!has_text(parse(self.boxes[b].agents.as_str()) ?? Json::Null, agent)) {
+    return fail Refusal::UnknownAgent;
+  }
+  if (#trim(prompt) == 0) {
+    return fail Refusal::Empty;
+  }
+  var id = String();
+  id.push_u64(self.next_id);
+  self.next_id += 1;
+  self.tasks.push(Task {
+    id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent),
+    title: from_str(first_line(prompt, 120)), session: String(), preview: String(), activity: String(),
+    state: TaskState::Working, archived: false, created: now, updated: now, turns: 0, entries: new::<String>(),
+    entry_ids: new::<String>()
+  });
+  self.send_turn(self.tasks.len() - 1, prompt, now);
+  return id;
+}
+
+fn Board::steer(var self&, id: str, prompt: str, now: i64): () ! Refusal {
+  let i = self.find_task(id) else {
+    return fail Refusal::NoSuchTask;
+  };
+  if (#trim(prompt) == 0) {
+    return fail Refusal::Empty;
+  }
+  let b = self.find_box(self.tasks[i].box_name.as_str()) else {
+    return fail Refusal::NoSuchBox;
+  };
+  if (!self.boxes[b].online) {
+    return fail Refusal::BoxOffline;
+  }
+  self.tasks[i].archived = false;
+  self.send_turn(i, prompt, now);
+  return ();
+}
+
+// Records the user's message and queues a turn for the task's box. The
+// worker runs it after any turn still in flight.
+fn Board::send_turn(var self&, i: usize, prompt: str, now: i64): () {
+  self.tasks[i].turns += 1;
+  var turn = from_str("t");
+  turn.push_u64(self.tasks[i].turns as u64);
+
+  var entry = object();
+  var entry_id = turn.clone();
+  entry_id.push_str(".you");
+  set(entry, "id", text(entry_id.as_str()));
+  set(entry, "kind", text("user"));
+  set(entry, "text", text(prompt));
+  set(entry, "at", number(now as f64));
+  self.put_entry(i, entry, now);
+
+  var msg = object();
+  set(msg, "type", text("turn"));
+  set(msg, "task", text(self.tasks[i].id.as_str()));
+  set(msg, "turn", text(turn.as_str()));
+  set(msg, "agent", text(self.tasks[i].agent.as_str()));
+  set(msg, "project", text(self.tasks[i].project.as_str()));
+  set(msg, "session", text(self.tasks[i].session.as_str()));
+  set(msg, "text", text(prompt));
+  if (let b = self.find_box(self.tasks[i].box_name.as_str())) {
+    self.boxes[b].outbox.push(to_string(msg));
+  }
+  self.set_state(i, TaskState::Working, now);
+}
+
+fn Board::stop(var self&, id: str, now: i64): () ! Refusal {
+  let i = self.find_task(id) else {
+    return fail Refusal::NoSuchTask;
+  };
+  var msg = object();
+  set(msg, "type", text("stop"));
+  set(msg, "task", text(id));
+  if (let b = self.find_box(self.tasks[i].box_name.as_str())) {
+    self.boxes[b].outbox.push(to_string(msg));
+  }
+  self.set_state(i, TaskState::Stopped, now);
+  return ();
+}
+
+fn Board::archive(var self&, id: str, archived: bool, now: i64): () ! Refusal {
+  let i = self.find_task(id) else {
+    return fail Refusal::NoSuchTask;
+  };
+  self.tasks[i].archived = archived;
+  self.tasks[i].updated = now;
+  self.touch_task(i);
+  return ();
+}
+
+// A worker said hello. Tasks it was running before it went away and no
+// longer runs have failed. Returns the box name.
+fn Board::attach(var self&, hello&: Json, now: i64): String {
+  let name = str_of(hello, "box") ?? "unnamed";
+  let b = self.find_box(name) ?? self.boxes.len();
+  if (b == self.boxes.len()) {
+    self.boxes.push(Box {
+      name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
+      stats: from_str("{}"), online: false, last_seen: now, outbox: new::<String>()
+    });
+  }
+  self.boxes[b].host = string_of(hello, "host");
+  self.boxes[b].os = string_of(hello, "os");
+  self.boxes[b].agents = to_string(get(hello, "agents") ?? Json::Null);
+  self.boxes[b].projects = to_string(get(hello, "projects") ?? Json::Null);
+  self.boxes[b].online = true;
+  self.boxes[b].last_seen = now;
+  self.touch_box(b);
+
+  for (let i in 0usize..self.tasks.len()) {
+    let t& = self.tasks[i];
+    let live = t.state == TaskState::Working || t.state == TaskState::Stalled;
+    if (live && t.box_name.as_str() == name && !listed(hello, "running", t.id.as_str())) {
+      var note = object();
+      var note_id = from_str("lost.");
+      note_id.push_i64(now);
+      set(note, "id", text(note_id.as_str()));
+      set(note, "kind", text("error"));
+      set(note, "text", text("The worker restarted while this task was running."));
+      set(note, "at", number(now as f64));
+      self.put_entry(i, note, now);
+      self.set_state(i, TaskState::Failed, now);
+    }
+  }
+  return from_str(name);
+}
+
+fn Board::detach(var self&, name: str, now: i64): () {
+  if (let b = self.find_box(name)) {
+    self.boxes[b].online = false;
+    self.boxes[b].last_seen = now;
+    self.touch_box(b);
+  }
+}
+
+// A line from a box's worker: an entry, a state change, a session id, or
+// the box's stats.
+fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
+  let kind = str_of(msg, "type") ?? "";
+  if (kind == "stats") {
+    if (let b = self.find_box(box_name)) {
+      self.boxes[b].stats = to_string(get(msg, "stats") ?? Json::Null);
+      self.boxes[b].last_seen = now;
+      self.touch_box(b);
+    }
+    return;
+  }
+  let i = self.find_task(str_of(msg, "task") ?? "") else {
+    return;
+  };
+  if (self.tasks[i].box_name.as_str() != box_name) {
+    return;
+  }
+  if (kind == "entry") {
+    if (let e = get(msg, "entry")) {
+      self.put_entry(i, copy(e), now);
+      if (self.tasks[i].state == TaskState::Stalled) {
+        self.set_state(i, TaskState::Working, now);
+      }
+    }
+  } else if (kind == "session") {
+    self.tasks[i].session = string_of(msg, "session");
+    self.touch_task(i);
+  } else if (kind == "state") {
+    let state = state_named(str_of(msg, "state") ?? "") else {
+      return;
+    };
+    // A stop the user asked for wins over the turn's own ending.
+    if (self.tasks[i].state == TaskState::Stopped && state != TaskState::Working) {
+      return;
+    }
+    self.set_state(i, state, now);
+  }
+}
+
+// Adds an entry, or merges it into the entry with the same id.
+fn Board::put_entry(var self&, i: usize, entry: Json, now: i64): () {
+  let id = string_of(entry, "id");
+  var at: usize? = none;
+  for (let k in 0usize..self.tasks[i].entry_ids.len()) {
+    if (self.tasks[i].entry_ids[k].eq(id)) {
+      at = k;
+    }
+  }
+  var e = entry;
+  if (let k = at) {
+    var old = parse(self.tasks[i].entries[k].as_str()) ?? object();
+    merge(old, e);
+    e = old;
+    self.tasks.at_var(i).entries.set(k, to_string(e));
+  } else {
+    self.tasks.at_var(i).entries.push(to_string(e));
+    self.tasks.at_var(i).entry_ids.push(id);
+  }
+
+  var t& = self.tasks.at_var(i);
+  t.updated = now;
+  let kind = str_of(e, "kind") ?? "";
+  let body = str_of(e, "text") ?? "";
+  if (kind == "agent" && #body > 0) {
+    t.preview = from_str(first_line(body, kPreviewBytes));
+  }
+  if (kind == "tool") {
+    if ((str_of(e, "state") ?? "") == "running") {
+      var activity = string_of(e, "tool");
+      activity.push_c8(' ');
+      activity.push_str(first_line(str_of(e, "detail") ?? "", kPreviewBytes));
+      t.activity = activity;
+    } else {
+      t.activity = String();
+    }
+  }
+
+  var data = object();
+  set(data, "task", text(t.id.as_str()));
+  set(data, "entry", e);
+  self.emit("entry", data);
+  self.touch_task(i);
+}
+
+fn Board::set_state(var self&, i: usize, state: TaskState, now: i64): () {
+  self.tasks[i].state = state;
+  self.tasks[i].updated = now;
+  if (state != TaskState::Working && state != TaskState::Stalled) {
+    self.tasks[i].activity = String();
+  }
+  self.touch_task(i);
+}
+
+fn Board::sweep(var self&, now: i64): () {
+  for (let i in 0usize..self.tasks.len()) {
+    if (self.tasks[i].state == TaskState::Working && now - self.tasks[i].updated > kStallMillis) {
+      self.tasks[i].state = TaskState::Stalled;
+      self.touch_task(i);
+    }
+  }
+}
+
+fn Board::take_outbox(var self&, box_name: str): Vector<String> {
+  let b = self.find_box(box_name) else {
+    return new::<String>();
+  };
+  return replace(self.boxes.at_var(b).outbox, new::<String>());
+}
+
+// The SSE frames after seq, or none when the feed no longer reaches back
+// that far and the client must reload the state.
+fn Board::frames_since(self&, seq: u64): Vector<String>? {
+  var out = new::<String>();
+  if (let first = self.feed.front()) {
+    if (first.seq > seq + 1) {
+      return none;
+    }
+  }
+  for (let c& in self.feed) {
+    if (c.seq > seq) {
+      out.push(c.frame.clone());
+    }
+  }
+  return out;
+}
+
+fn Board::take_dirty_tasks(var self&): Vector<String> {
+  return replace(self.dirty_tasks, new::<String>());
+}
+
+fn Board::take_dirty_boxes(var self&): bool {
+  let out = self.dirty_boxes;
+  self.dirty_boxes = false;
+  return out;
+}
+
+fn Board::emit(var self&, kind: str, data&: Json): () {
+  self.seq += 1;
+  var frame = from_str("id: ");
+  frame.push_u64(self.seq);
+  frame.push_str("\nevent: ");
+  frame.push_str(kind);
+  frame.push_str("\ndata: ");
+  frame.push_str(to_string(data).as_str());
+  frame.push_str("\n\n");
+  self.feed.push_back(Change { seq: self.seq, frame });
+  if (self.feed.len() > kFeedLength) {
+    let _ = self.feed.pop_front();
+  }
+}
+
+fn Board::touch_task(var self&, i: usize): () {
+  let summary = summary_json(self.tasks[i]);
+  self.emit("task", summary);
+  for (let id& in self.dirty_tasks) {
+    if (id.eq(self.tasks[i].id)) {
+      return;
+    }
+  }
+  self.dirty_tasks.push(self.tasks[i].id.clone());
+}
+
+fn Board::touch_box(var self&, b: usize): () {
+  let j = box_json(self.boxes[b]);
+  self.emit("box", j);
+  self.dirty_boxes = true;
+}
+
+fn summary_json(t&: Task): Json {
+  var o = object();
+  set(o, "id", text(t.id.as_str()));
+  set(o, "box", text(t.box_name.as_str()));
+  set(o, "project", text(t.project.as_str()));
+  set(o, "agent", text(t.agent.as_str()));
+  set(o, "title", text(t.title.as_str()));
+  set(o, "session", text(t.session.as_str()));
+  set(o, "preview", text(t.preview.as_str()));
+  set(o, "activity", text(t.activity.as_str()));
+  set(o, "state", text(state_name(t.state)));
+  set(o, "archived", boolean(t.archived));
+  set(o, "created", number(t.created as f64));
+  set(o, "updated", number(t.updated as f64));
+  set(o, "turns", number(t.turns as f64));
+  return o;
+}
+
+fn box_json(b&: Box): Json {
+  var o = object();
+  set(o, "name", text(b.name.as_str()));
+  set(o, "host", text(b.host.as_str()));
+  set(o, "os", text(b.os.as_str()));
+  set(o, "online", boolean(b.online));
+  set(o, "lastSeen", number(b.last_seen as f64));
+  set(o, "agents", parse(b.agents.as_str()) ?? array());
+  set(o, "projects", parse(b.projects.as_str()) ?? array());
+  set(o, "stats", parse(b.stats.as_str()) ?? object());
+  return o;
+}
+
+fn Board::boxes_json(self&): Json {
+  var out = array();
+  for (let b& in self.boxes) {
+    push(out, box_json(b));
+  }
+  return out;
+}
+
+fn Board::state_json(self&): Json {
+  var tasks = array();
+  for (let t& in self.tasks) {
+    push(tasks, summary_json(t));
+  }
+  var o = object();
+  set(o, "seq", number(self.seq as f64));
+  set(o, "boxes", self.boxes_json());
+  set(o, "tasks", tasks);
+  return o;
+}
+
+// A task with its whole thread; also the form it is saved in.
+fn Board::task_json(self&, id: str): Json? {
+  let i = self.find_task(id) else {
+    return none;
+  };
+  var o = summary_json(self.tasks[i]);
+  var entries = array();
+  for (let e& in self.tasks[i].entries) {
+    push(entries, parse(e.as_str()) ?? Json::Null);
+  }
+  set(o, "entries", entries);
+  return o;
+}
+
+fn Board::restore_task(var self&, j&: Json): () {
+  let id = string_of(j, "id");
+  if (let n = parse_id(id.as_str())) {
+    if (n >= self.next_id) {
+      self.next_id = n + 1;
+    }
+  }
+  // A task that was working stays so; its worker's next hello fails it if
+  // the turn died meanwhile.
+  let state = state_named(str_of(j, "state") ?? "") ?? TaskState::Idle;
+  var entries = new::<String>();
+  var entry_ids = new::<String>();
+  if (let items = as_array(get(j, "entries") ?? Json::Null)) {
+    for (let e& in items) {
+      entries.push(to_string(e));
+      entry_ids.push(string_of(e, "id"));
+    }
+  }
+  self.tasks.push(Task {
+    id, box_name: string_of(j, "box"), project: string_of(j, "project"), agent: string_of(j, "agent"),
+    title: string_of(j, "title"), session: string_of(j, "session"), preview: string_of(j, "preview"),
+    activity: String(), state, archived: bool_of(j, "archived") ?? false,
+    created: (num_of(j, "created") ?? 0.0) as i64, updated: (num_of(j, "updated") ?? 0.0) as i64,
+    turns: (num_of(j, "turns") ?? 0.0) as u32, entries, entry_ids
+  });
+}
+
+fn Board::restore_box(var self&, j&: Json): () {
+  self.boxes.push(Box {
+    name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
+    agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
+    stats: from_str("{}"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64, outbox: new::<String>()
+  });
+}
+
+fn parse_id(s: str): u64? {
+  if (#s == 0) {
+    return none;
+  }
+  var n: u64 = 0;
+  for (let c in s) {
+    if (c < '0' || c > '9') {
+      return none;
+    }
+    n = n * 10 + (c as u64 - '0' as u64);
+  }
+  return n;
+}

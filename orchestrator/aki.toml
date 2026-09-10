@@ -1,0 +1,11 @@
+[package]
+name = "orchestrator"
+kind = "exe"
+version = "0.1.0"
+description = "Steers the agents on every box and serves the app"
+
+[dependencies]
+wire = { path = "../wire" }
+
+[build]
+opt = 2
