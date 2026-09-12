@@ -1,0 +1,55 @@
+// Server-sent events for the app: every board change after the client's
+// position, as it happens. When the feed no longer reaches back that far,
+// a `reset` event tells the client to reload /api/state.
+
+module orchestrator::stream;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector} from akibase::containers::vector;
+import {TcpStream} from akibase::net::tcp;
+import {now, seconds} from akibase::time::time;
+import {Board} from orchestrator::board;
+import {Hub} from orchestrator::hub;
+
+comptime let kHead: str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
+
+struct Batch {
+  pub var frames: Vector<String>?
+  pub var seq: u64
+}
+
+pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64): () {
+  if (let _ = stream.write_all(from_str(kHead).as_bytes())) {
+  } else {
+    return;
+  }
+  var seq = since;
+  var last_write = now();
+  while (true) {
+    let seen = hub.changed.current();
+    let batch = hub.board.with(fn(b: &var Board): Batch => Batch { frames: b.frames_since(seq), seq: b.last_seq() });
+    var out = String();
+    if (let frames = batch.frames) {
+      for (let f& in frames) {
+        out.push_str(f.as_str());
+      }
+      seq = batch.seq;
+    } else {
+      out.push_str("event: reset\ndata: {}\n\n");
+      seq = batch.seq;
+    }
+    // A comment line now and then keeps proxies and NAT from closing an
+    // idle stream, and finds clients that left.
+    if (out.len() == 0 && last_write.elapsed() > seconds(20)) {
+      out.push_str(": ping\n\n");
+    }
+    if (out.len() > 0) {
+      if (let _ = stream.write_all(out.as_bytes())) {
+        last_write = now();
+      } else {
+        return;
+      }
+    }
+    hub.changed.wait_change(seen);
+  }
+}

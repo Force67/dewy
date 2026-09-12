@@ -1,0 +1,75 @@
+// Worker connections. A worker dials in, says hello with the token, then
+// streams its lines while the dock hands it the lines waiting in its box's
+// outbox. Reads time out often so the outbox never waits long.
+
+module orchestrator::dock;
+
+import {String} from akibase::strings::base_string;
+import {Vector} from akibase::containers::vector;
+import {TcpStream} from akibase::net::tcp;
+import {SharedPointer} from akibase::memory::shared_pointer;
+import {Json} from akibase::text::json;
+import {milliseconds, seconds, now} from akibase::time::time;
+import {eprintln} from akibase::logging;
+import {LineStream} from wire::line_stream;
+import {str_of} from wire::fields;
+import {Board} from orchestrator::board;
+import {Hub, now_ms} from orchestrator::hub;
+
+pub struct DockConnection : Send {
+  pub var stream: TcpStream
+  pub var hub: SharedPointer<Hub>
+}
+
+pub fn serve_worker(c: DockConnection): () {
+  var stream = c.stream;
+  let hub& = c.hub.get();
+  let _ = stream.set_read_timeout(milliseconds(250));
+  let _ = stream.set_write_timeout(seconds(10));
+  var link = LineStream(stream);
+  let hello = read_hello(link, hub.token.as_str()) else {
+    return;
+  };
+  let name = hub.board.with(fn(b: &var Board): String => b.attach(hello, now_ms()));
+  hub.changed.notify_all();
+  eprintln(f"dock: {name} attached".as_str());
+  while (true) {
+    if (let got = link.read()) {
+      if (let msg = got) {
+        hub.board.with(fn(b: &var Board): () => b.apply(name.as_str(), msg, now_ms()));
+        hub.changed.notify_all();
+      }
+    } else {
+      break;
+    }
+    let out = hub.board.with(fn(b: &var Board): Vector<String> => b.take_outbox(name.as_str()));
+    var sent = true;
+    for (let line& in out) {
+      if (let _ = link.send_text(line.as_str())) {
+      } else {
+        sent = false;
+      }
+    }
+    if (!sent) {
+      break;
+    }
+  }
+  hub.board.with(fn(b: &var Board): () => b.detach(name.as_str(), now_ms()));
+  hub.changed.notify_all();
+  eprintln(f"dock: {name} left".as_str());
+}
+
+// The first line must be a hello with the right token, within ten seconds.
+fn read_hello(var link&: LineStream, token: str): Json? {
+  let start = now();
+  while (start.elapsed() < seconds(10)) {
+    let got = link.read() else {
+      return none;
+    };
+    if (let j = got) {
+      let ok = (str_of(j, "type") ?? "") == "hello" && (str_of(j, "token") ?? "") == token && #token > 0;
+      return ok ? j : none;
+    }
+  }
+  return none;
+}

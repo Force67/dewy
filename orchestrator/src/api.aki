@@ -1,0 +1,193 @@
+// The app's HTTP API. Every route but /api/health wants the token as
+// "Authorization: Bearer <token>". Each connection carries one request;
+// /api/stream keeps its connection for server-sent events.
+//
+//   GET  /api/state                   boxes and task summaries, with the feed position
+//   GET  /api/tasks/<id>              one task with its thread
+//   POST /api/tasks                   {box, project, agent, text}: start a task
+//   POST /api/tasks/<id>/messages     {text}: steer a task
+//   POST /api/tasks/<id>/stop
+//   POST /api/tasks/<id>/archive      {archived}
+//   GET  /api/stream?since=<seq>      changes after seq as server-sent events
+
+module orchestrator::api;
+
+import {String} from akibase::strings::base_string;
+import {TcpStream} from akibase::net::tcp;
+import {Request, finish, kMaxHead, path_part, read_error_status, read_request, send_response, error_body}
+  from akibase::net::http;
+import {SharedPointer} from akibase::memory::shared_pointer;
+import {Json, object, set, text, boolean, parse, to_string} from akibase::text::json;
+import {utf8_lossy} from akibase::text::code_convert;
+import {split} from akibase::strings::string_util;
+import {find, strip_prefix} from akibase::strings::string_search;
+import {parse_u64} from akibase::strings::string_to_number;
+import {seconds} from akibase::time::time;
+import {str_of, bool_of} from wire::fields;
+import {Board, Refusal, refusal_message} from orchestrator::board;
+import {Hub, now_ms} from orchestrator::hub;
+import {stream_changes} from orchestrator::stream;
+
+comptime let kMaxBody: usize = 1 << 20;
+
+pub struct AppConnection : Send {
+  pub var stream: TcpStream
+  pub var hub: SharedPointer<Hub>
+}
+
+struct Reply {
+  pub var status: u32
+  pub var body: String
+}
+
+fn json_reply(status: u32, j&: Json): Reply => Reply { status, body: to_string(j) };
+
+fn error_reply(status: u32, message: str): Reply {
+  var o = object();
+  set(o, "error", text(message));
+  return json_reply(status, o);
+}
+
+fn refusal_reply(r: Refusal): Reply {
+  let status: u32 = match (r) {
+    Refusal::NoSuchBox => 404,
+    Refusal::NoSuchTask => 404,
+    Refusal::BoxOffline => 409,
+    Refusal::Empty => 400,
+    Refusal::UnknownAgent => 400,
+  };
+  return error_reply(status, refusal_message(r));
+}
+
+fn ok_reply(): Reply {
+  var o = object();
+  set(o, "ok", boolean(true));
+  return json_reply(200, o);
+}
+
+pub fn serve_app(c: AppConnection): () {
+  var stream = c.stream;
+  let hub& = c.hub.get();
+  let _ = stream.set_read_timeout(seconds(10));
+  let _ = stream.set_write_timeout(seconds(10));
+  let r = read_request(stream, kMaxHead, kMaxBody) else (let e) {
+    let status = read_error_status(e);
+    if (status != 0) {
+      let body = error_body(status);
+      let _ = send_response(stream, status, "text/plain; charset=utf-8", body.as_bytes(), [], true);
+    }
+    return;
+  };
+  let path = path_part(r.target.as_str());
+  if (path != "/api/health" && !authorized(r, hub.token.as_str())) {
+    send(stream, error_reply(401, "missing or wrong token"));
+    return;
+  }
+  if (r.method.eq_str("GET") && path == "/api/stream") {
+    stream_changes(stream, hub, since(r.target.as_str()));
+    return;
+  }
+  let reply = route(r, path, hub);
+  send(stream, reply);
+}
+
+fn send(var stream&: TcpStream, reply: Reply): () {
+  let _ = send_response(stream, reply.status, "application/json", reply.body.as_bytes(), [], true);
+  finish(stream);
+}
+
+fn authorized(r&: Request, token: str): bool {
+  let given = strip_prefix(r.header("Authorization") ?? "", "Bearer ") else {
+    return false;
+  };
+  if (#given != #token || #token == 0) {
+    return false;
+  }
+  var diff: u8 = 0;
+  for (let i in 0usize..#token) {
+    diff = diff | (given[i] as u8 ^ token[i] as u8);
+  }
+  return diff == 0;
+}
+
+fn since(target: str): u64 {
+  let at = find(target, "since=") else {
+    return 0;
+  };
+  return parse_u64(target[at + 6..]) ?? 0;
+}
+
+fn body_json(r&: Request): Json? => parse(utf8_lossy(r.body.as_slice()).as_str());
+
+fn route(r&: Request, path: str, hub&: Hub): Reply {
+  let parts = split(path, "/");
+  // "/api/tasks/7/stop" splits into "", "api", "tasks", "7", "stop".
+  let n = parts.len();
+  let get = r.method.eq_str("GET");
+  let post = r.method.eq_str("POST");
+  if (path == "/api/health") {
+    return ok_reply();
+  }
+  if (get && path == "/api/state") {
+    let j = hub.board.with(fn(b: &var Board): Json => b.state_json());
+    return json_reply(200, j);
+  }
+  if (post && path == "/api/tasks") {
+    return start_task(r, hub);
+  }
+  if (n < 4 || parts[1] != "api" || parts[2] != "tasks") {
+    return error_reply(404, "no such route");
+  }
+  let id = parts[3];
+  if (get && n == 4) {
+    let found = hub.board.with(fn(b: &var Board): Json? => b.task_json(id));
+    if (let j = found) {
+      return json_reply(200, j);
+    }
+    return refusal_reply(Refusal::NoSuchTask);
+  }
+  if (!post || n != 5) {
+    return error_reply(404, "no such route");
+  }
+  let now = now_ms();
+  let action = parts[4];
+  let body = body_json(r) ?? object();
+  let result = hub.board.with(fn(b: &var Board): () ! Refusal {
+    if (action == "messages") {
+      return b.steer(id, str_of(body, "text") ?? "", now);
+    }
+    if (action == "stop") {
+      return b.stop(id, now);
+    }
+    if (action == "archive") {
+      return b.archive(id, bool_of(body, "archived") ?? true, now);
+    }
+    return fail Refusal::NoSuchTask;
+  });
+  hub.changed.notify_all();
+  if (let _ = result) {
+    return ok_reply();
+  } else (let e) {
+    return refusal_reply(e);
+  }
+}
+
+fn start_task(r&: Request, hub&: Hub): Reply {
+  let body = body_json(r) else {
+    return error_reply(400, "the body is not JSON");
+  };
+  let now = now_ms();
+  let created = hub.board.with(fn(b: &var Board): String ! Refusal => b.create_task(
+    str_of(body, "box") ?? "", str_of(body, "project") ?? "", str_of(body, "agent") ?? "", str_of(body, "text") ?? "",
+    now));
+  hub.changed.notify_all();
+  if (let id = created) {
+    let found = hub.board.with(fn(b: &var Board): Json? => b.task_json(id.as_str()));
+    if (let j = found) {
+      return json_reply(201, j);
+    }
+  } else (let e) {
+    return refusal_reply(e);
+  }
+  return error_reply(500, "the task vanished");
+}

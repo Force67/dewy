@@ -1,0 +1,127 @@
+// dewy's orchestrator: the app talks HTTP to one port, workers dial the
+// other. The main thread accepts app connections, one thread accepts
+// workers, and one keeps time: it marks stalled tasks, saves what changed,
+// and wakes the event streams so they can ping.
+
+module orchestrator;
+
+import {String, from_str} from akibase::strings::base_string;
+import {new} from akibase::containers::vector;
+import {arg, arg_count} from akibase::command_line;
+import {OptionParser, Options, message} from akibase::option;
+import {TcpListener, bind_to, net_error_message} from akibase::net::tcp;
+import {parse_ipv4, SocketAddress} from akibase::net::socket_address;
+import {get_environment_variable} from akibase::environment_variables;
+import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
+import {Mutex} from akibase::threading::mutex;
+import {Condvar} from akibase::threading::condition_variable;
+import {ThreadPool} from akibase::threading::thread_pool;
+import {spawn} from akibase::threading::thread;
+import {seconds, sleep} from akibase::time::time;
+import {eprintln, print} from akibase::logging;
+import {Board} from orchestrator::board;
+import {Hub, now_ms} from orchestrator::hub;
+import {Pending, load, prepare, write} from orchestrator::snapshot;
+import {AppConnection, serve_app} from orchestrator::api;
+import {DockConnection, serve_worker} from orchestrator::dock;
+
+// Each open app stream and worker link holds a pool thread, and akibase
+// threads cannot detach, so the pools bound how many there can be.
+comptime let kAppThreads: usize = 48;
+comptime let kDockThreads: usize = 32;
+
+fn parser(): OptionParser {
+  var p = OptionParser("orchestrator", "Steers the coding agents on your boxes and serves the dewy app.");
+  p.value("host", none, "ADDR", "IPv4 address to listen on (default 0.0.0.0)");
+  p.int_value("port", 'p', "N", "port for the app (default 8787)");
+  p.int_value("worker-port", 'w', "N", "port for workers (default 8788)");
+  p.value("data", 'd', "DIR", "where tasks are kept (default ./data)");
+  return p;
+}
+
+pub fn main(): i32 {
+  var args = new::<str>();
+  for (let i in 1..arg_count()) {
+    args.push(arg(i));
+  }
+  let p = parser();
+  let o = p.parse(args.as_slice()) else (let e) {
+    eprintln(f"orchestrator: {message(e)}".as_str());
+    return 2;
+  };
+  if (o.flag("help")) {
+    print(p.help().as_str());
+    return 0;
+  }
+  let token = get_environment_variable("DEWY_TOKEN") ?? String();
+  if (token.len() < 16) {
+    eprintln("orchestrator: set DEWY_TOKEN to a secret of at least 16 characters");
+    return 2;
+  }
+  return run(o, token);
+}
+
+fn listen(ip: [u8; 4], port: i64): TcpListener? {
+  let at = SocketAddress { ip, port: port as u16 };
+  let l = bind_to(at) else (let e) {
+    eprintln(f"orchestrator: cannot listen on {at.to_string()}: {net_error_message(e)}".as_str());
+    return none;
+  };
+  return l;
+}
+
+fn run(o&: Options, token: String): i32 {
+  let ip = parse_ipv4(o.value("host") ?? "0.0.0.0") else {
+    eprintln("orchestrator: --host must be an IPv4 address");
+    return 2;
+  };
+  let data = from_str(o.value("data") ?? "data");
+  var board = Board();
+  let restored = load(data.as_str(), board);
+  let app = listen(ip, o.int("port") ?? 8787) else {
+    return 1;
+  };
+  let docks = listen(ip, o.int("worker-port") ?? 8788) else {
+    return 1;
+  };
+  print(f"orchestrator: {restored} tasks from {data}, app on {app.local_address()!.to_string()}, workers on {docks.local_address()!.to_string()}\n".as_str());
+
+  let hub = make_shared(Hub { board: Mutex::<Board>(board), changed: Condvar(), token });
+  let keeper = spawn(keep_time, (hub.share(), data));
+  let dock = spawn(accept_workers, (docks, hub.share()));
+  let pool = ThreadPool(kAppThreads);
+  while (true) {
+    if (let stream = app.accept()) {
+      pool.enqueue(serve_app, AppConnection { stream, hub: hub.share() });
+    }
+  }
+  dock.join();
+  keeper.join();
+  return 0;
+}
+
+fn accept_workers(args: (TcpListener, SharedPointer<Hub>)): () {
+  let (listener, hub) = args;
+  let pool = ThreadPool(kDockThreads);
+  while (true) {
+    if (let stream = listener.accept()) {
+      pool.enqueue(serve_worker, DockConnection { stream, hub: hub.share() });
+    }
+  }
+}
+
+fn keep_time(args: (SharedPointer<Hub>, String)): () {
+  let (hub, data) = args;
+  while (true) {
+    sleep(seconds(2));
+    let now = now_ms();
+    let pending = hub.get().board.with(fn(b: &var Board): Pending {
+      b.sweep(now);
+      return prepare(b);
+    });
+    if (!write(data.as_str(), pending)) {
+      eprintln("orchestrator: could not save every task");
+    }
+    hub.get().changed.notify_all();
+  }
+}
