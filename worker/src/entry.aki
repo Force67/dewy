@@ -1,0 +1,65 @@
+// The thread entries a worker reports, whatever agent wrote them:
+//
+//   {"id", "kind": "agent", "text"}
+//   {"id", "kind": "tool", "tool", "detail", "state": "running" | "ok" | "error", "output"}
+//   {"id", "kind": "note" | "error", "text"}
+//
+// An entry with a known id updates that entry, so a tool call reports its
+// result under the id it started with.
+
+module worker::entry;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Json, object, set, text, number} from akibase::text::json;
+import {unix_time_milliseconds} from akibase::time::time;
+import {clip} from wire::clip;
+
+// Tool output beyond this is cut; the phone shows a glimpse, not a log.
+comptime let kOutputBytes: usize = 4000;
+
+pub fn entry_id(turn: str, local: str): String {
+  var id = from_str(turn);
+  id.push_c8('.');
+  id.push_str(local);
+  return id;
+}
+
+fn base(id: str, kind: str): Json {
+  var e = object();
+  set(e, "id", text(id));
+  set(e, "kind", text(kind));
+  set(e, "at", number(unix_time_milliseconds() as f64));
+  return e;
+}
+
+pub fn said(id: str, kind: str, body: str): Json {
+  var e = base(id, kind);
+  set(e, "text", text(body));
+  return e;
+}
+
+pub fn tool_started(id: str, tool: str, detail: str): Json {
+  var e = base(id, "tool");
+  set(e, "tool", text(tool));
+  set(e, "detail", text(clip(detail, kOutputBytes)));
+  set(e, "state", text("running"));
+  return e;
+}
+
+// A tool result carries only what changed, so it keeps the "at" of its start.
+pub fn tool_finished(id: str, ok: bool, output: str): Json {
+  var e = object();
+  set(e, "id", text(id));
+  set(e, "state", text(ok ? "ok" : "error"));
+  set(e, "output", text(clip(output, kOutputBytes)));
+  return e;
+}
+
+// Wraps an entry as the line the orchestrator expects.
+pub fn entry_message(task: str, e: Json): Json {
+  var m = object();
+  set(m, "type", text("entry"));
+  set(m, "task", text(task));
+  set(m, "entry", e);
+  return m;
+}

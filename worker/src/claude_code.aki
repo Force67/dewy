@@ -1,0 +1,110 @@
+// Claude Code in print mode: `claude -p <text> --output-format stream-json`
+// writes one JSON event per line. A turn resumes the task's session with
+// --resume.
+
+module worker::claude_code;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Command} from akibase::process::child;
+import {Json, get, as_array, as_str, path} from akibase::text::json;
+import {str_of, bool_of} from wire::fields;
+import {first_line} from wire::clip;
+import {said, tool_started, tool_finished} from worker::entry;
+import {Transcript} from worker::transcript;
+
+pub fn claude_command(text: str, session: str, yolo: bool): Command {
+  var c = Command("claude");
+  c.arg("-p");
+  c.arg(text);
+  c.arg("--output-format");
+  c.arg("stream-json");
+  c.arg("--verbose");
+  if (yolo) {
+    c.arg("--dangerously-skip-permissions");
+  } else {
+    c.arg("--permission-mode");
+    c.arg("acceptEdits");
+  }
+  if (#session > 0) {
+    c.arg("--resume");
+    c.arg(session);
+  }
+  return c;
+}
+
+pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
+  var out = new::<Json>();
+  let kind = str_of(line, "type") ?? "";
+  if (let s = str_of(line, "session_id")) {
+    t.session = from_str(s);
+  }
+  if (kind == "assistant" || kind == "user") {
+    let blocks = as_array(path(line, "message.content") ?? Json::Null) else {
+      return out;
+    };
+    for (let b& in blocks) {
+      let block = str_of(b, "type") ?? "";
+      if (block == "text") {
+        let body = str_of(b, "text") ?? "";
+        if (#body > 0) {
+          out.push(said(t.next_id().as_str(), "agent", body));
+        }
+      } else if (block == "tool_use") {
+        let id = t.id_for(str_of(b, "id") ?? "");
+        let name = str_of(b, "name") ?? "tool";
+        out.push(tool_started(id.as_str(), name, summary(get(b, "input") ?? Json::Null).as_str()));
+      } else if (block == "tool_result") {
+        let id = t.id_for(str_of(b, "tool_use_id") ?? "");
+        let ok = !(bool_of(b, "is_error") ?? false);
+        out.push(tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str()));
+      }
+    }
+  } else if (kind == "result") {
+    if (bool_of(line, "is_error") ?? false) {
+      t.failed = true;
+      let why = str_of(line, "result") ?? "Claude stopped with an error.";
+      out.push(said(t.next_id().as_str(), "error", why));
+    }
+    if (let denials = as_array(get(line, "permission_denials") ?? Json::Null)) {
+      for (let d& in denials) {
+        var note = from_str("Claude was not allowed to use ");
+        note.push_str(str_of(d, "tool_name") ?? "a tool");
+        let what = summary(get(d, "tool_input") ?? Json::Null);
+        if (what.len() > 0) {
+          note.push_str(": ");
+          note.push_str(what.as_str());
+        }
+        out.push(said(t.next_id().as_str(), "note", note.as_str()));
+      }
+    }
+  }
+  return out;
+}
+
+// The one input field that says what a tool call does.
+fn summary(input&: Json): String {
+  let keys = ["command", "file_path", "pattern", "url", "query", "description", "prompt", "path"];
+  for (let k in keys) {
+    if (let v = str_of(input, k)) {
+      return from_str(first_line(v, 300));
+    }
+  }
+  return String();
+}
+
+// A tool result is text, or a list of blocks of which the text ones count.
+fn result_text(content&: Json): String {
+  if (let s = as_str(content)) {
+    return from_str(s);
+  }
+  var out = String();
+  if (let blocks = as_array(content)) {
+    for (let b& in blocks) {
+      if (let s = str_of(b, "text")) {
+        out.push_str(s);
+      }
+    }
+  }
+  return out;
+}

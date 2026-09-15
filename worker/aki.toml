@@ -1,0 +1,11 @@
+[package]
+name = "worker"
+kind = "exe"
+version = "0.1.0"
+description = "Runs coding agents on a box for the dewy orchestrator"
+
+[dependencies]
+wire = { path = "../wire" }
+
+[build]
+opt = 2

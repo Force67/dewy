@@ -1,0 +1,111 @@
+// Codex: `codex exec --json <text>` writes one JSON event per line, and
+// `codex exec resume <session> --json <text>` continues a session. Item ids
+// restart every turn, so they are prefixed with the turn.
+
+module worker::codex;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Command} from akibase::process::child;
+import {Json, get, as_array} from akibase::text::json;
+import {str_of, num_of} from wire::fields;
+import {find} from akibase::strings::string_search;
+import {said, tool_started, tool_finished} from worker::entry;
+import {Transcript} from worker::transcript;
+
+pub fn codex_command(text: str, session: str, yolo: bool): Command {
+  var c = Command("codex");
+  c.arg("exec");
+  if (#session > 0) {
+    c.arg("resume");
+    c.arg(session);
+  }
+  c.arg("--json");
+  c.arg("--skip-git-repo-check");
+  if (yolo) {
+    c.arg("--dangerously-bypass-approvals-and-sandbox");
+  } else {
+    c.arg("-c");
+    c.arg("sandbox_mode=\"workspace-write\"");
+  }
+  c.arg(text);
+  return c;
+}
+
+pub fn read_codex(var t&: Transcript, line&: Json): Vector<Json> {
+  var out = new::<Json>();
+  let kind = str_of(line, "type") ?? "";
+  if (kind == "thread.started") {
+    t.session = from_str(str_of(line, "thread_id") ?? "");
+  } else if (kind == "turn.failed" || kind == "error") {
+    t.failed = true;
+    let nested = get(line, "error");
+    var why = str_of(line, "message") ?? "Codex failed.";
+    if (let e = nested) {
+      why = str_of(e, "message") ?? why;
+    }
+    out.push(said(t.next_id().as_str(), "error", why));
+  } else if (kind == "item.started" || kind == "item.completed" || kind == "item.updated") {
+    let item = get(line, "item") else {
+      return out;
+    };
+    let id = t.id_for(str_of(item, "id") ?? "");
+    let done = kind == "item.completed";
+    let item_type = str_of(item, "type") ?? "";
+    if (item_type == "agent_message" && done) {
+      out.push(said(id.as_str(), "agent", str_of(item, "text") ?? ""));
+    } else if (item_type == "command_execution") {
+      if (done) {
+        let ok = (num_of(item, "exit_code") ?? 1.0) == 0.0;
+        out.push(tool_finished(id.as_str(), ok, str_of(item, "aggregated_output") ?? ""));
+      } else {
+        out.push(tool_started(id.as_str(), "shell", shell_command(str_of(item, "command") ?? "")));
+      }
+    } else if (item_type == "file_change") {
+      if (done) {
+        out.push(tool_finished(id.as_str(), (str_of(item, "status") ?? "") != "failed", ""));
+      } else {
+        out.push(tool_started(id.as_str(), "edit", changed_paths(item).as_str()));
+      }
+    } else if (item_type == "web_search") {
+      if (!done) {
+        out.push(tool_started(id.as_str(), "search", str_of(item, "query") ?? ""));
+      } else {
+        out.push(tool_finished(id.as_str(), true, ""));
+      }
+    } else if (item_type == "mcp_tool_call") {
+      if (!done) {
+        var name = from_str(str_of(item, "server") ?? "mcp");
+        name.push_c8('.');
+        name.push_str(str_of(item, "tool") ?? "");
+        out.push(tool_started(id.as_str(), name.as_str(), ""));
+      } else {
+        out.push(tool_finished(id.as_str(), (str_of(item, "status") ?? "") != "failed", ""));
+      }
+    } else if (item_type == "error" && done) {
+      out.push(said(id.as_str(), "error", str_of(item, "message") ?? "Codex reported an error."));
+    }
+  }
+  return out;
+}
+
+// "/bin/bash -lc ls -la" reads better as "ls -la".
+fn shell_command(command: str): str {
+  if (let at = find(command, " -lc ")) {
+    return command[at + 5..];
+  }
+  return command;
+}
+
+fn changed_paths(item&: Json): String {
+  var out = String();
+  if (let changes = as_array(get(item, "changes") ?? Json::Null)) {
+    for (let c& in changes) {
+      if (out.len() > 0) {
+        out.push_str(", ");
+      }
+      out.push_str(str_of(c, "path") ?? "");
+    }
+  }
+  return out;
+}

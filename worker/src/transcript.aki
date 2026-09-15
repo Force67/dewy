@@ -1,0 +1,32 @@
+// What one turn's reader remembers between lines of agent output.
+
+module worker::transcript;
+
+import {String, from_str} from akibase::strings::base_string;
+import {entry_id} from worker::entry;
+
+pub struct Transcript : Send {
+  pub var turn: String
+  pub var session: String
+  // The agent reported that the turn failed.
+  pub var failed: bool
+  var count: u32
+
+  pub fn Transcript(turn: str, session: str): Transcript;
+  pub fn next_id(var self&): String;
+  pub fn id_for(self&, local: str): String;
+}
+
+fn Transcript::Transcript(turn: str, session: str): Transcript => Transcript {
+  turn: from_str(turn), session: from_str(session), failed: false, count: 0
+};
+
+// A fresh id for an entry the agent gave none.
+fn Transcript::next_id(var self&): String {
+  self.count += 1;
+  var local = from_str("m");
+  local.push_u64(self.count as u64);
+  return entry_id(self.turn.as_str(), local.as_str());
+}
+
+fn Transcript::id_for(self&, local: str): String => entry_id(self.turn.as_str(), local);
