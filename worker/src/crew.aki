@@ -1,0 +1,197 @@
+// The turns running on this box. One turn per task runs at a time; a
+// message for a task that is busy waits until its turn ends, then resumes
+// the session that turn left.
+
+module worker::crew;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Json, array, push, text} from akibase::text::json;
+import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
+import {Mutex} from akibase::threading::mutex;
+import {Atomic} from akibase::atomic;
+import {Thread, spawn} from akibase::threading::thread;
+import {send_signal, kSignalTerminate} from akibase::process::child;
+import {replace} from akibase::algorithm;
+import {str_of, string_of} from wire::fields;
+import {said, entry_message} from worker::entry;
+import {Ended, Outbox, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
+
+struct Running {
+  pub var task: String
+  pub var pid: SharedPointer<Atomic<i32>>
+  pub var stopped: SharedPointer<Atomic<i32>>
+  pub var thread: Thread<()>
+}
+
+struct Session {
+  pub var task: String
+  pub var id: String
+}
+
+pub struct Crew {
+  var outbox: SharedPointer<Mutex<Outbox>>
+  var running: Vector<Running>
+  var waiting: Vector<TurnOrder>
+  var sessions: Vector<Session>
+  var yolo: bool
+
+  pub fn Crew(yolo: bool): Crew;
+  pub fn order(var self&, msg&: Json): ();
+  pub fn collect(var self&): Vector<String>;
+  pub fn put_back(var self&, lines: Vector<String>): ();
+  pub fn running_tasks(self&): Json;
+  fn start(var self&, o: TurnOrder): ();
+  fn stop(var self&, task: str): ();
+  fn is_running(self&, task: str): bool;
+  fn session_of(self&, task: str): String;
+  fn remember(var self&, e: Ended): ();
+}
+
+fn Crew::Crew(yolo: bool): Crew => Crew {
+  outbox: make_shared(Mutex::<Outbox>(Outbox { lines: new::<String>(), ended: new::<Ended>() })),
+  running: new::<Running>(), waiting: new::<TurnOrder>(), sessions: new::<Session>(), yolo
+};
+
+// A line from the orchestrator: a turn to run or a task to stop.
+fn Crew::order(var self&, msg&: Json): () {
+  let kind = str_of(msg, "type") ?? "";
+  let task = str_of(msg, "task") ?? "";
+  if (kind == "stop") {
+    self.stop(task);
+    return;
+  }
+  if (kind != "turn") {
+    return;
+  }
+  let agent = agent_named(str_of(msg, "agent") ?? "") else {
+    var e = entry_message(task, said("agent", "error", "This box has no such agent."));
+    post(self.outbox, e);
+    post(self.outbox, state_message(task, "failed"));
+    return;
+  };
+  let o = TurnOrder {
+    task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
+    session: string_of(msg, "session"), text: string_of(msg, "text")
+  };
+  if (self.is_running(task)) {
+    self.waiting.push(o);
+  } else {
+    self.start(o);
+  }
+}
+
+fn Crew::start(var self&, o: TurnOrder): () {
+  var order = o;
+  if (order.session.is_empty()) {
+    order.session = self.session_of(order.task.as_str());
+  }
+  let task = order.task.clone();
+  let pid = make_shared(Atomic::<i32>(0));
+  let stopped = make_shared(Atomic::<i32>(0));
+  let job = TurnJob { order, yolo: self.yolo, outbox: self.outbox.share(), pid: pid.share(), stopped: stopped.share() };
+  let thread = spawn(run_turn, job);
+  self.running.push(Running { task, pid, stopped, thread });
+}
+
+fn Crew::stop(var self&, task: str): () {
+  var i: usize = 0;
+  while (i < self.waiting.len()) {
+    if (self.waiting[i].task.as_str() == task) {
+      let _ = self.waiting.remove(i);
+    } else {
+      i += 1;
+    }
+  }
+  for (let r& in self.running) {
+    if (r.task.as_str() == task) {
+      r.stopped.get().store(1);
+      let pid = r.pid.get().load();
+      if (pid > 0) {
+        // The agent leads its own process group; end its tools with it.
+        let _ = send_signal(-pid, kSignalTerminate);
+      }
+    }
+  }
+}
+
+// Ends finished turns, starts what waited on them, and hands over the
+// lines to send.
+fn Crew::collect(var self&): Vector<String> {
+  let (lines, ended) = self.outbox.get().with(fn(o: &var Outbox): (Vector<String>, Vector<Ended>) {
+    return (replace(o.lines, new::<String>()), replace(o.ended, new::<Ended>()));
+  });
+  var list = ended;
+  while (list.len() > 0) {
+    self.remember(list.remove(0));
+  }
+  return lines;
+}
+
+fn Crew::remember(var self&, e: Ended): () {
+  var i: usize = 0;
+  while (i < self.running.len()) {
+    if (self.running[i].task.eq(e.task)) {
+      let r = self.running.remove(i);
+      r.thread.join();
+    } else {
+      i += 1;
+    }
+  }
+  var known = false;
+  for (var s& in self.sessions) {
+    if (s.task.eq(e.task)) {
+      if (!e.session.is_empty()) {
+        s.id = e.session.clone();
+      }
+      known = true;
+    }
+  }
+  if (!known) {
+    self.sessions.push(Session { task: e.task.clone(), id: e.session.clone() });
+  }
+  for (let k in 0usize..self.waiting.len()) {
+    if (self.waiting[k].task.eq(e.task)) {
+      let next = self.waiting.remove(k);
+      self.start(next);
+      return;
+    }
+  }
+}
+
+// Lines that could not be sent go first next time.
+fn Crew::put_back(var self&, lines: Vector<String>): () {
+  self.outbox.get().with_arg(lines, fn(o: &var Outbox, older: Vector<String>): () {
+    var all = older;
+    for (let l& in o.lines) {
+      all.push(l.clone());
+    }
+    o.lines = all;
+  });
+}
+
+fn Crew::running_tasks(self&): Json {
+  var out = array();
+  for (let r& in self.running) {
+    push(out, text(r.task.as_str()));
+  }
+  return out;
+}
+
+fn Crew::is_running(self&, task: str): bool {
+  for (let r& in self.running) {
+    if (r.task.as_str() == task) {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn Crew::session_of(self&, task: str): String {
+  for (let s& in self.sessions) {
+    if (s.task.as_str() == task) {
+      return s.id.clone();
+    }
+  }
+  return String();
+}

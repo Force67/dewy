@@ -1,0 +1,111 @@
+// A named pipe that an agent writes its standard output into, read line by
+// line as it arrives. akibase's Command redirects streams only to paths,
+// and its File reads through stdio, which waits for a full buffer, so this
+// reads the descriptor directly.
+//
+// The read end opens without blocking before the agent starts: the child
+// opens the write end before exec, and Command::spawn waits for the exec,
+// so a reader that opened after spawn would never get there.
+
+module worker::fifo;
+
+import {String, from_str, with_nul} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {utf8_lossy} from akibase::text::code_convert;
+import {delete_file} from akibase::filesystem::file_util;
+
+extern("mkfifo") fn c_mkfifo(path: *const c8, mode: u32): i32;
+extern("open") fn c_open(path: *const c8, flags: i32): i32;
+extern("read") fn c_read(fd: i32, p: *var u8, n: usize): i64;
+extern("close") fn c_close(fd: i32): i32;
+extern("fcntl") fn c_fcntl(fd: i32, cmd: i32, ...): i32;
+
+comptime let kReadOnlyNonBlocking: i32 = 0o4000;
+comptime let kGetFlags: i32 = 3;
+comptime let kSetFlags: i32 = 4;
+
+pub struct Fifo : Drop, Send {
+  var path: String
+  var fd: i32
+  var buf: Vector<u8>
+  var head: usize
+
+  fn Fifo(path: String, fd: i32): Fifo;
+  pub fn block(var self&): ();
+  pub fn read_line(var self&): String?;
+  pub fn drop(var self&): ();
+}
+
+pub fn make_fifo(path: str): Fifo? {
+  let c = with_nul(path);
+  let _ = delete_file(path);
+  var fd: i32 = -1;
+  unsafe {
+    if (c_mkfifo(@ptr(c.as_str()), 0o600) != 0) {
+      return none;
+    }
+    fd = c_open(@ptr(c.as_str()), kReadOnlyNonBlocking);
+  }
+  if (fd < 0) {
+    let _ = delete_file(path);
+    return none;
+  }
+  return Fifo(from_str(path), fd);
+}
+
+fn Fifo::Fifo(path: String, fd: i32): Fifo => Fifo { path, fd, buf: new::<u8>(), head: 0 };
+
+// Makes reads wait for data, once the writer is there.
+fn Fifo::block(var self&): () {
+  unsafe {
+    let flags = c_fcntl(self.fd, kGetFlags);
+    let _ = c_fcntl(self.fd, kSetFlags, flags & ~kReadOnlyNonBlocking);
+  }
+}
+
+// The next line without its newline, or none once every writer closed.
+fn Fifo::read_line(var self&): String? {
+  while (true) {
+    for (let i in self.head..#self.buf) {
+      if (self.buf[i] == 10) {
+        let line = utf8_lossy(self.buf.as_slice()[self.head..i]);
+        self.head = i + 1;
+        return line;
+      }
+    }
+    if (self.head > 0) {
+      var rest = new::<u8>();
+      for (let i in self.head..#self.buf) {
+        rest.push(self.buf[i]);
+      }
+      self.buf = rest;
+      self.head = 0;
+    }
+    var chunk = [0u8; 65536];
+    var n: i64 = 0;
+    unsafe {
+      n = c_read(self.fd, @ptr(chunk), 65536);
+    }
+    if (n <= 0) {
+      if (#self.buf > 0) {
+        let line = utf8_lossy(self.buf.as_slice());
+        self.buf = new::<u8>();
+        return line;
+      }
+      return none;
+    }
+    for (let i in 0usize..n as usize) {
+      self.buf.push(chunk[i]);
+    }
+  }
+  return none;
+}
+
+fn Fifo::drop(var self&): () {
+  if (self.fd >= 0) {
+    unsafe {
+      let _ = c_close(self.fd);
+    }
+  }
+  let _ = delete_file(self.path.as_str());
+}

@@ -1,0 +1,180 @@
+// One turn of one agent on its own thread: start the agent in the
+// project, read its output through a named pipe as it comes, and post the
+// entries it translates to into the outbox the main loop sends from.
+
+module worker::turn;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector} from akibase::containers::vector;
+import {spawn_error_message, exit_code} from akibase::process::child;
+import {Json, parse, object, set, text, to_string} from akibase::text::json;
+import {SharedPointer} from akibase::memory::shared_pointer;
+import {Mutex} from akibase::threading::mutex;
+import {Atomic} from akibase::atomic;
+import {read_file, delete_file} from akibase::filesystem::file_util;
+import {temp_directory} from akibase::filesystem::common_directory_providers;
+import {join} from akibase::filesystem::path;
+import {system_now} from akibase::time::time;
+import {trim} from akibase::strings::string_search;
+import {clip} from wire::clip;
+import {said, entry_message} from worker::entry;
+import {Transcript} from worker::transcript;
+import {make_fifo} from worker::fifo;
+import {claude_command, read_claude} from worker::claude_code;
+import {codex_command, read_codex} from worker::codex;
+
+pub enum Agent { Claude, Codex }
+
+pub fn agent_named(name: str): Agent? => match (name) {
+  "claude" => Agent::Claude,
+  "codex" => Agent::Codex,
+  _ => none,
+};
+
+pub fn agent_name(a: Agent): str<'static> => match (a) {
+  Agent::Claude => "claude",
+  Agent::Codex => "codex",
+};
+
+// A turn that ended, so the crew can start the next one for its task.
+pub struct Ended : Send {
+  pub var task: String
+  pub var session: String
+}
+
+pub struct Outbox : Send {
+  // JSON lines for the orchestrator.
+  pub var lines: Vector<String>
+  pub var ended: Vector<Ended>
+}
+
+pub struct TurnOrder : Send {
+  pub var task: String
+  pub var turn: String
+  pub var agent: Agent
+  pub var project: String
+  pub var session: String
+  pub var text: String
+}
+
+pub struct TurnJob : Send {
+  pub var order: TurnOrder
+  pub var yolo: bool
+  pub var outbox: SharedPointer<Mutex<Outbox>>
+  pub var pid: SharedPointer<Atomic<i32>>
+  // Set by the crew when the user stopped the task.
+  pub var stopped: SharedPointer<Atomic<i32>>
+}
+
+pub fn post(outbox&: SharedPointer<Mutex<Outbox>>, j&: Json): () {
+  outbox.get().with_arg(to_string(j), fn(o: &var Outbox, line: String): () {
+    o.lines.push(line);
+  });
+}
+
+pub fn state_message(task: str, state: str): Json {
+  var m = object();
+  set(m, "type", text("state"));
+  set(m, "task", text(task));
+  set(m, "state", text(state));
+  return m;
+}
+
+fn session_message(task: str, session: str): Json {
+  var m = object();
+  set(m, "type", text("session"));
+  set(m, "task", text(task));
+  set(m, "session", text(session));
+  return m;
+}
+
+pub fn run_turn(job: TurnJob): () {
+  let o& = job.order;
+  let task = o.task.as_str();
+  var stem = from_str("dewy-");
+  stem.push_str(task);
+  stem.push_c8('-');
+  stem.push_i64(system_now().unix_nanoseconds());
+  let out_path = join(temp_directory().as_str(), stem.as_str());
+  var err_path = out_path.clone();
+  err_path.push_str(".err");
+
+  var t = Transcript(o.turn.as_str(), o.session.as_str());
+  var ok = run_agent(job, out_path.as_str(), err_path.as_str(), t);
+  if (t.failed) {
+    ok = false;
+  }
+  let _ = delete_file(err_path.as_str());
+  if (job.stopped.get().load() == 0) {
+    post(job.outbox, state_message(task, ok ? "idle" : "failed"));
+  }
+  job.outbox.get().with_arg(Ended { task: o.task.clone(), session: t.session.clone() },
+    fn(out: &var Outbox, e: Ended): () {
+      out.ended.push(e);
+    });
+}
+
+// Runs the agent to the end; false when it could not start or exited
+// with an error.
+fn run_agent(job&: TurnJob, out_path: str, err_path: str, var t&: Transcript): bool {
+  let o& = job.order;
+  let task = o.task.as_str();
+  var fifo = make_fifo(out_path) else {
+    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", "The worker could not create a pipe.")));
+    return false;
+  };
+  var cmd = match (o.agent) {
+    Agent::Claude => claude_command(o.text.as_str(), o.session.as_str(), job.yolo),
+    Agent::Codex => codex_command(o.text.as_str(), o.session.as_str(), job.yolo),
+  };
+  cmd.current_dir(o.project.as_str());
+  cmd.stdin_from("/dev/null");
+  cmd.stdout_to(out_path);
+  cmd.stderr_to(err_path);
+  cmd.new_process_group();
+  var child = cmd.spawn() else (let e) {
+    var why = from_str("Could not start ");
+    why.push_str(agent_name(o.agent));
+    why.push_str(": ");
+    why.push_str(spawn_error_message(e));
+    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", why.as_str())));
+    return false;
+  };
+  job.pid.get().store(child.id());
+  var session = o.session.clone();
+  fifo.block();
+  while (let line = fifo.read_line()) {
+    let j = parse(line.as_str()) else {
+      continue;
+    };
+    let entries = match (o.agent) {
+      Agent::Claude => read_claude(t, j),
+      Agent::Codex => read_codex(t, j),
+    };
+    if (!t.session.eq(session)) {
+      session = t.session.clone();
+      post(job.outbox, session_message(task, session.as_str()));
+    }
+    var list = entries;
+    while (list.len() > 0) {
+      post(job.outbox, entry_message(task, list.remove(0)));
+    }
+  }
+  let status = child.wait();
+  job.pid.get().store(0);
+  if (exit_code(status) == 0) {
+    return true;
+  }
+  if (!t.failed && job.stopped.get().load() == 0) {
+    let err = read_file(err_path) ?? String();
+    var why = from_str(agent_name(o.agent));
+    why.push_str(" exited with an error.");
+    let tail = trim(err.as_str());
+    if (#tail > 0) {
+      why.push_str("\n\n");
+      why.push_str(clip(tail, 1500));
+    }
+    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", why.as_str())));
+  }
+  return false;
+}
