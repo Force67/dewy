@@ -1,0 +1,135 @@
+// dewy's worker: runs the coding agents on this box for the orchestrator.
+// It dials out, so boxes behind NAT need no open port, and it redials
+// with a growing pause when the link drops. Turns keep running meanwhile
+// and their lines wait until the link is back.
+
+module worker;
+
+import {String, from_str} from akibase::strings::base_string;
+import {new} from akibase::containers::vector;
+import {arg, arg_count} from akibase::command_line;
+import {OptionParser, Options, message} from akibase::option;
+import {connect_to} from akibase::net::tcp;
+import {SocketAddress} from akibase::net::socket_address;
+import {get_environment_variable} from akibase::environment_variables;
+import {split} from akibase::strings::string_util;
+import {split_last_once} from akibase::strings::string_search;
+import {parse_u32} from akibase::strings::string_to_number;
+import {milliseconds, seconds, sleep, now} from akibase::time::time;
+import {eprintln, print} from akibase::logging;
+import {LineStream} from wire::line_stream;
+import {Crew} from worker::crew;
+import {hello, hostname, stats} from worker::inventory;
+import {resolve_ipv4} from worker::resolve;
+
+fn parser(): OptionParser {
+  var p = OptionParser("worker", "Runs coding agents on this box for the dewy orchestrator.");
+  p.value("orchestrator", 'o', "HOST:PORT", "where the orchestrator takes workers (default $DEWY_ORCHESTRATOR)");
+  p.value("name", 'n', "NAME", "the box's name in the app (default the host name)");
+  p.list("projects", 'p', "DIR", "a git repository, or a directory of them (default $DEWY_PROJECTS, colon-separated)");
+  p.flag("yolo", none, "let agents run any command without asking; only on boxes you can wipe");
+  return p;
+}
+
+pub fn main(): i32 {
+  var args = new::<str>();
+  for (let i in 1..arg_count()) {
+    args.push(arg(i));
+  }
+  let p = parser();
+  let o = p.parse(args.as_slice()) else (let e) {
+    eprintln(f"worker: {message(e)}".as_str());
+    return 2;
+  };
+  if (o.flag("help")) {
+    print(p.help().as_str());
+    return 0;
+  }
+  return run(o);
+}
+
+fn run(o&: Options): i32 {
+  let token = get_environment_variable("DEWY_TOKEN") ?? String();
+  if (token.is_empty()) {
+    eprintln("worker: set DEWY_TOKEN to the orchestrator's token");
+    return 2;
+  }
+  let target = from_str(o.value("orchestrator") ?? (get_environment_variable("DEWY_ORCHESTRATOR") ?? String()).as_str());
+  let (host, port_text) = split_last_once(target.as_str(), ':') else {
+    eprintln("worker: pass --orchestrator HOST:PORT");
+    return 2;
+  };
+  let port = parse_u32(port_text) ?? 0;
+  if (port == 0 || port > 65535) {
+    eprintln("worker: the orchestrator's port is not a number");
+    return 2;
+  }
+  let name = from_str(o.value("name") ?? hostname().as_str());
+  var roots = new::<String>();
+  for (let r& in o.values("projects")) {
+    roots.push(r.clone());
+  }
+  if (roots.is_empty()) {
+    let env = get_environment_variable("DEWY_PROJECTS") ?? String();
+    for (let r in split(env.as_str(), ":")) {
+      if (#r > 0) {
+        roots.push(from_str(r));
+      }
+    }
+  }
+
+  var crew = Crew(o.flag("yolo"));
+  var pause = seconds(1);
+  while (true) {
+    if (let ip = resolve_ipv4(host)) {
+      let at = SocketAddress { ip, port: port as u16 };
+      if (let stream = connect_to(at)) {
+        pause = seconds(1);
+        var s = stream;
+        let _ = s.set_read_timeout(milliseconds(200));
+        let _ = s.set_write_timeout(seconds(10));
+        print(f"worker: {name} linked to {at.to_string()}\n".as_str());
+        serve(LineStream(s), crew, token.as_str(), name.as_str(), roots.as_slice());
+        eprintln("worker: lost the orchestrator");
+      }
+    } else {
+      eprintln(f"worker: cannot resolve {host}".as_str());
+    }
+    sleep(pause);
+    pause = pause.times(2) > seconds(30) ? seconds(30) : pause.times(2);
+  }
+  return 0;
+}
+
+// Relays until the link breaks.
+fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [String]): () {
+  var l = link;
+  if (let _ = l.send(hello(token, name, roots, crew.running_tasks()))) {
+  } else {
+    return;
+  }
+  var last_stats = now();
+  let _ = l.send(stats());
+  while (true) {
+    let got = l.read() else {
+      return;
+    };
+    if (let msg = got) {
+      crew.order(msg);
+    }
+    var lines = crew.collect();
+    while (lines.len() > 0) {
+      let line = lines.remove(0);
+      if (let _ = l.send_text(line.as_str())) {
+      } else {
+        lines.insert(0, line);
+        crew.put_back(lines);
+        return;
+      }
+    }
+    if (last_stats.elapsed() > seconds(15)) {
+      last_stats = now();
+      let _ = l.send(stats());
+    }
+  }
+}
