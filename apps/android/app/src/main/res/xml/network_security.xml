@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The orchestrator speaks plain HTTP; run it on a private network such as a
+     tailnet, or put TLS in front of it. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
