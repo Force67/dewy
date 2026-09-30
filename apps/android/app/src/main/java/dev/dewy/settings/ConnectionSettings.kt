@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.json.Json
 
 data class Connection(val serverUrl: String, val token: String)
 
@@ -16,7 +17,7 @@ private val Context.connectionStore: DataStore<Preferences> by preferencesDataSt
 
 /**
  * Where the orchestrator is, the token for it, whether to notify, whether
- * new tasks start in yolo mode, and the model picked last.
+ * new tasks start in yolo mode, the model picked last, and the budgets.
  */
 class ConnectionSettings(context: Context) {
     private val store = context.connectionStore
@@ -33,6 +34,11 @@ class ConnectionSettings(context: Context) {
 
     val model: Flow<String> = store.data.map { it[modelKey] ?: "" }
 
+    /** Dollar caps per opencode provider, by spend window name ("5 hours"). */
+    val budgets: Flow<Map<String, Map<String, Double>>> = store.data.map { p ->
+        p[budgetsKey]?.let { runCatching { Json.decodeFromString<Map<String, Map<String, Double>>>(it) }.getOrNull() }.orEmpty()
+    }
+
     suspend fun save(connection: Connection) = store.edit {
         it[urlKey] = connection.serverUrl
         it[tokenKey] = connection.token
@@ -46,11 +52,17 @@ class ConnectionSettings(context: Context) {
 
     suspend fun setModel(model: String) = store.edit { it[modelKey] = model }
 
+    suspend fun setBudget(provider: String, caps: Map<String, Double>) = store.edit { p ->
+        val all = p[budgetsKey]?.let { runCatching { Json.decodeFromString<Map<String, Map<String, Double>>>(it) }.getOrNull() }.orEmpty()
+        p[budgetsKey] = Json.encodeToString(if (caps.isEmpty()) all - provider else all + (provider to caps))
+    }
+
     private companion object {
         val urlKey = stringPreferencesKey("server_url")
         val tokenKey = stringPreferencesKey("token")
         val notifyKey = booleanPreferencesKey("notify")
         val yoloKey = booleanPreferencesKey("yolo")
         val modelKey = stringPreferencesKey("model")
+        val budgetsKey = stringPreferencesKey("budgets")
     }
 }

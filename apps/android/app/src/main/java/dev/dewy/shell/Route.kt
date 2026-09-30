@@ -16,6 +16,7 @@ sealed interface Route : NavKey {
     @Serializable data class Thread(val taskId: String) : Route
     @Serializable data class BoxInfo(val name: String) : Route
     @Serializable data object Settings : Route
+    @Serializable data object Usage : Route
 
-    val isDetail get() = this is Thread || this is BoxInfo || this is Settings
+    val isDetail get() = this is Thread || this is BoxInfo || this is Settings || this is Usage
 }

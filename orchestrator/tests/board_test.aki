@@ -2,7 +2,7 @@ module board_test;
 
 import {String} from akibase::strings::base_string;
 import {contains} from akibase::strings::string_search;
-import {parse, to_string, array} from akibase::text::json;
+import {parse, to_string, array, as_array} from akibase::text::json;
 import {eprintln} from akibase::logging;
 import {str_of} from wire::fields;
 import {Board, Refusal, kStallMillis} from orchestrator::board;
@@ -144,6 +144,16 @@ pub fn main(): i32 {
   check(next.len() == 1 && contains(next[0].as_str(), "\"model\":\"opencode-go/kimi-k3\""), "later turns run the new model", failures);
   let _ = b.set_model(picked.as_str(), "", 870006);
   check(contains(to_string(b.task_json(picked.as_str())!).as_str(), "\"model\":\"\""), "empty is the default", failures);
+
+  // Usage: a meter replaces the one for the same agent and provider.
+  let _ = b.apply("lab", parse("{\"type\":\"usage\",\"meters\":[{\"agent\":\"codex\",\"provider\":\"openai\",\"limits\":[{\"name\":\"7 days\",\"used\":0.5}]},{\"agent\":\"opencode\",\"provider\":\"opencode-go\",\"spend\":[]}]}")!, 880000);
+  let _ = b.apply("lab", parse("{\"type\":\"usage\",\"meters\":[{\"agent\":\"codex\",\"provider\":\"openai\",\"limits\":[{\"name\":\"7 days\",\"used\":0.75}]}]}")!, 880001);
+  let lab = to_string(b.boxes_json());
+  check(contains(lab.as_str(), "\"usage\":[{\"agent\":\"opencode\",\"provider\":\"opencode-go\",\"spend\":[]},{\"agent\":\"codex\",\"provider\":\"openai\",\"limits\":[{\"name\":\"7 days\",\"used\":0.75"),
+        "the newest meter wins, the others stay", failures);
+  var restored = Board();
+  restored.restore_box(as_array(parse(lab.as_str())!)![1]);
+  check(contains(to_string(restored.boxes_json()).as_str(), "\"used\":0.75"), "meters are saved with the box", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

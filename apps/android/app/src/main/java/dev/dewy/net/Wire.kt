@@ -76,9 +76,31 @@ data class Box(
     val projects: List<Project> = emptyList(),
     /** The models each agent offers, where the box lists them. */
     val models: Map<String, List<String>> = emptyMap(),
+    val usage: List<Meter> = emptyList(),
     val stats: BoxStats = BoxStats(),
     val sessions: List<TerminalSession> = emptyList(),
 )
+
+/**
+ * What a box knows about one agent's provider: its limits, as fractions
+ * used, and for opencode what it spent. See docs/adr/0005-usage-limits.md.
+ */
+@Serializable
+data class Meter(
+    val agent: String = "",
+    val provider: String = "",
+    val plan: String = "",
+    val at: Long = 0,
+    val limits: List<Limit> = emptyList(),
+    val spend: List<Spend> = emptyList(),
+)
+
+/** [resets] is 0 when unknown. */
+@Serializable
+data class Limit(val name: String = "", val used: Double = 0.0, val resets: Long = 0)
+
+@Serializable
+data class Spend(val name: String = "", val cost: Double = 0.0, val tokens: Double = 0.0)
 
 /** A Claude Code session running in a terminal on a box, which a task can follow. */
 @Serializable

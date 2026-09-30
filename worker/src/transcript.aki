@@ -10,6 +10,8 @@ pub struct Transcript : Send {
   pub var session: String
   // The agent reported that the turn failed.
   pub var failed: bool
+  // A meter the agent reported, as JSON text, until it is sent.
+  pub var usage: String
   var count: u32
 
   pub fn Transcript(turn: str, session: str): Transcript;
@@ -18,7 +20,7 @@ pub struct Transcript : Send {
 }
 
 fn Transcript::Transcript(turn: str, session: str): Transcript => Transcript {
-  turn: from_str(turn), session: from_str(session), failed: false, count: 0
+  turn: from_str(turn), session: from_str(session), failed: false, usage: String(), count: 0
 };
 
 // A fresh id for an entry the agent gave none.

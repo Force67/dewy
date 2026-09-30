@@ -1,0 +1,373 @@
+// Measures the box's usage every two minutes on its own thread and posts
+// the meters for the orchestrator: Codex's limits from its newest session
+// files, opencode's spend per provider from its database, and the quotas
+// of the providers that answer them. Claude's come with its turns.
+
+module worker::measure;
+
+import {String, from_str, with_nul, str_as_bytes} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Command, exit_code} from akibase::process::child;
+import {Json, array, push, parse, get, as_array, to_string} from akibase::text::json;
+import {SharedPointer} from akibase::memory::shared_pointer;
+import {Mutex} from akibase::threading::mutex;
+import {read_file, delete_file} from akibase::filesystem::file_util;
+import {list_directory} from akibase::filesystem::directory;
+import {join} from akibase::filesystem::path;
+import {get_environment_variable} from akibase::environment_variables;
+import {utf8_lossy} from akibase::text::code_convert;
+import {lines} from akibase::strings::string_util;
+import {contains, ends_with, starts_with} from akibase::strings::string_search;
+import {sort} from akibase::algorithm;
+import {seconds, sleep, system_now, unix_time_milliseconds} from akibase::time::time;
+import {str_of, num_of} from wire::fields;
+import {Outbox, private_temp} from worker::turn;
+import {on_path} from worker::inventory;
+import {Meter, kSpendWindows, meter, claude_usage_meter, codex_meter, opencode_meters, add_zai, add_copilot, usage_message} from worker::usage;
+
+// A rollout's `rate_limits` is in its last lines; the files grow past 100 MB.
+comptime let kTailBytes: usize = 1 << 20;
+
+pub struct MeasureJob : Send {
+  pub var outbox: SharedPointer<Mutex<Outbox>>
+}
+
+pub fn measure_forever(job: MeasureJob): () {
+  while (true) {
+    var meters = array();
+    if (on_path("claude")) {
+      if (let m = claude_limits()) {
+        push(meters, m.to_json());
+      }
+    }
+    if (on_path("codex")) {
+      if (let m = codex_limits()) {
+        push(meters, m.to_json());
+      }
+    }
+    if (on_path("opencode")) {
+      for (let m& in opencode_usage()) {
+        // A provider with a key but no quota and no spend says nothing.
+        if (m.limits.len() > 0 || m.spend.len() > 0) {
+          push(meters, m.to_json());
+        }
+      }
+    }
+    if (let list = as_array(meters)) {
+      if (#list > 0) {
+        job.outbox.get().with_arg(to_string(usage_message(meters)), fn(o: &var Outbox, line: String): () {
+          o.measured = line;
+        });
+      }
+    }
+    sleep(seconds(120));
+  }
+}
+
+fn home(): String => get_environment_variable("HOME") ?? String();
+
+// Claude's limits from Anthropic, asked with the box's Claude login. An
+// expired login answers nothing until Claude Code refreshes it; turns
+// still report the limits meanwhile.
+fn claude_limits(): Meter? {
+  let dir = get_environment_variable("CLAUDE_CONFIG_DIR") ?? join(home().as_str(), ".claude");
+  let text = read_file(join(dir.as_str(), ".credentials.json").as_str()) else (let e) {
+    return none;
+  };
+  let creds = parse(text.as_str()) else {
+    return none;
+  };
+  let login = get(creds, "claudeAiOauth") else {
+    return none;
+  };
+  let token = str_of(login, "accessToken") else {
+    return none;
+  };
+  let now = unix_time_milliseconds();
+  if ((num_of(login, "expiresAt") ?? 0.0) as i64 <= now) {
+    return none;
+  }
+  var headers = from_str("Authorization: Bearer ");
+  headers.push_str(token);
+  headers.push_str("\nanthropic-beta: oauth-2025-04-20\nAccept: application/json");
+  let answer = fetch("https://api.anthropic.com/api/oauth/usage", headers.as_str()) else {
+    return none;
+  };
+  return claude_usage_meter(answer, now);
+}
+
+fn sorted_names(dir: str): Vector<String> {
+  var names = list_directory(dir) ?? new::<String>();
+  sort(names.as_slice_var());
+  return names;
+}
+
+// The newest `count` rollout files by name, newest first. Their names
+// start with the time the session began.
+fn newest_rollouts(count: usize): Vector<String> {
+  var root = get_environment_variable("CODEX_HOME") ?? join(home().as_str(), ".codex");
+  let sessions = join(root.as_str(), "sessions");
+  var out = new::<String>();
+  var years = sorted_names(sessions.as_str());
+  while (years.len() > 0 && out.len() < count) {
+    let y = join(sessions.as_str(), years.pop()!.as_str());
+    var months = sorted_names(y.as_str());
+    while (months.len() > 0 && out.len() < count) {
+      let m = join(y.as_str(), months.pop()!.as_str());
+      var days = sorted_names(m.as_str());
+      while (days.len() > 0 && out.len() < count) {
+        let d = join(m.as_str(), days.pop()!.as_str());
+        var files = sorted_names(d.as_str());
+        while (files.len() > 0 && out.len() < count) {
+          let f = files.pop()!;
+          if (starts_with(f.as_str(), "rollout-") && ends_with(f.as_str(), ".jsonl")) {
+            out.push(join(d.as_str(), f.as_str()));
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// The rate limits Codex saw last, in whichever of its newest sessions
+// wrote them last.
+fn codex_limits(): Meter? {
+  var best: Meter? = none;
+  var best_at: i64 = -1;
+  for (let file& in newest_rollouts(3)) {
+    if (let m = last_rate_limits(file.as_str())) {
+      if (m.at > best_at) {
+        best_at = m.at;
+        best = m;
+      }
+    }
+  }
+  return best;
+}
+
+extern("open") fn c_open(path: *const c8, flags: i32): i32;
+extern("openat") fn c_openat(dir: i32, path: *const c8, flags: i32, mode: u32): i32;
+extern("lseek") fn c_lseek(fd: i32, offset: i64, whence: i32): i64;
+extern("read") fn c_read(fd: i32, p: *var u8, n: usize): i64;
+extern("write") fn c_write(fd: i32, p: *const u8, n: usize): i64;
+extern("close") fn c_close(fd: i32): i32;
+
+comptime let kReadOnly: i32 = 0;
+comptime let kSeekEnd: i32 = 2;
+comptime let kCurrentDir: i32 = -100;
+// O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW on Linux.
+comptime let kCreatePrivate: i32 = 0o1 | 0o100 | 0o200 | 0o400000;
+
+// The last `n` bytes of a file, read rather than mapped: a mapped file
+// that shrinks kills the process.
+fn tail_of(path: str, n: usize): Vector<u8>? {
+  let c = with_nul(path);
+  var fd: i32 = -1;
+  unsafe {
+    fd = c_open(@ptr(c.as_str()), kReadOnly);
+  }
+  if (fd < 0) {
+    return none;
+  }
+  var out = new::<u8>();
+  var chunk = [0u8; 65536];
+  unsafe {
+    let size = c_lseek(fd, 0, kSeekEnd);
+    let start = size > n as i64 ? size - n as i64 : 0;
+    if (size >= 0 && c_lseek(fd, start, 0) >= 0) {
+      while (true) {
+        let got = c_read(fd, @ptr(chunk), 65536);
+        if (got <= 0) {
+          break;
+        }
+        for (let i in 0usize..got as usize) {
+          out.push(chunk[i]);
+        }
+      }
+    }
+    let _ = c_close(fd);
+  }
+  return out;
+}
+
+// Writes a new file only this user can read, refusing one that exists or
+// a symlink, whoever owns the directory.
+fn write_private(path: str, body: str): bool {
+  let c = with_nul(path);
+  let bytes = str_as_bytes(body);
+  var wrote: i64 = -1;
+  unsafe {
+    let fd = c_openat(kCurrentDir, @ptr(c.as_str()), kCreatePrivate, 0o600);
+    if (fd < 0) {
+      return false;
+    }
+    wrote = c_write(fd, @ptr(bytes), #bytes);
+    let _ = c_close(fd);
+  }
+  return wrote == #bytes as i64;
+}
+
+fn last_rate_limits(file: str): Meter? {
+  let bytes = tail_of(file, kTailBytes) else {
+    return none;
+  };
+  let tail = utf8_lossy(bytes.as_slice());
+  var found: Meter? = none;
+  for (let line in lines(tail.as_str())) {
+    if (contains(line, "\"rate_limits\"")) {
+      if (let j = parse(line)) {
+        if (let m = codex_meter(j)) {
+          found = m;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+fn temp_path(name: str): String {
+  var stem = from_str("dewy-");
+  stem.push_str(name);
+  stem.push_c8('-');
+  stem.push_i64(system_now().unix_nanoseconds());
+  return join(private_temp().as_str(), stem.as_str());
+}
+
+// Runs `c` with its output in a file; its text, or none when it failed or
+// hung.
+fn output_of(var c&: Command, name: str): String? {
+  let out = temp_path(name);
+  c.stdin_from("/dev/null");
+  c.stdout_to(out.as_str());
+  c.stderr_to("/dev/null");
+  var child = c.spawn() else (let e) {
+    return none;
+  };
+  var text: String? = none;
+  if (let status = child.wait_timeout(seconds(30))) {
+    if (exit_code(status) == 0) {
+      if (let t = read_file(out.as_str())) {
+        text = t;
+      }
+    }
+  } else {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  let _ = delete_file(out.as_str());
+  return text;
+}
+
+fn spend_query(now: i64): String {
+  var q = from_str("select json_extract(data,'$.providerID') as provider");
+  for (let (_, column, span) in kSpendWindows) {
+    let since = now - span;
+    q.push_str(f", sum(case when time_created >= {since} then json_extract(data,'$.cost') else 0 end) as c{column}".as_str());
+    q.push_str(f", sum(case when time_created >= {since} then json_extract(data,'$.tokens.total') else 0 end) as t{column}".as_str());
+  }
+  let month = now - 2592000000;
+  q.push_str(f" from message where json_extract(data,'$.role') = 'assistant' and time_created >= {month} group by provider".as_str());
+  return q;
+}
+
+fn opencode_usage(): Vector<Meter> {
+  let now = unix_time_milliseconds();
+  var meters = new::<Meter>();
+  var c = Command("opencode");
+  c.arg("db");
+  c.arg("--format");
+  c.arg("json");
+  c.arg(spend_query(now).as_str());
+  if (let out = output_of(c, "spend")) {
+    if (let rows = parse(out.as_str())) {
+      meters = opencode_meters(rows, now);
+    }
+  }
+  let data = join(home().as_str(), ".local/share/opencode");
+  let auth = parse((read_file(join(data.as_str(), "auth.json").as_str()) ?? String()).as_str()) ?? Json::Null;
+  let accounts = parse((read_file(join(data.as_str(), "account.json").as_str()) ?? String()).as_str()) ?? Json::Null;
+  if (let key = secret(auth, accounts, "zai-coding-plan", "key")) {
+    var header = from_str("Authorization: ");
+    header.push_str(key.as_str());
+    if (let answer = fetch("https://api.z.ai/api/monitor/usage/quota/limit", header.as_str())) {
+      let i = meter_for(meters, "zai-coding-plan", now);
+      add_zai(meters[i], answer);
+    }
+  }
+  if (let token = secret(auth, accounts, "github-copilot", "refresh")) {
+    var header = from_str("Authorization: token ");
+    header.push_str(token.as_str());
+    header.push_str("\nUser-Agent: dewy");
+    if (let answer = fetch("https://api.github.com/copilot_internal/user", header.as_str())) {
+      let i = meter_for(meters, "github-copilot", now);
+      add_copilot(meters[i], answer);
+    }
+  }
+  return meters;
+}
+
+// Where the provider's meter is, added when it spent nothing yet.
+fn meter_for(var meters&: Vector<Meter>, provider: str, now: i64): usize {
+  for (let i in 0usize..meters.len()) {
+    if (meters[i].provider.as_str() == provider) {
+      return i;
+    }
+  }
+  meters.push(meter("opencode", provider, "", now));
+  return meters.len() - 1;
+}
+
+// A credential opencode keeps: in auth.json by provider, or in
+// account.json's accounts by service.
+fn secret(auth&: Json, accounts&: Json, provider: str, field: str): String? {
+  if (let c = get(auth, provider)) {
+    if (let v = str_of(c, field)) {
+      return from_str(v);
+    }
+  }
+  if (let list = get(accounts, "accounts")) {
+    match (list) {
+      Json::Obj(let members&) => {
+        for (let a& in members) {
+          if ((str_of(a.value, "serviceID") ?? "") == provider) {
+            if (let c = get(a.value, "credential")) {
+              if (let v = str_of(c, field)) {
+                return from_str(v);
+              }
+            }
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  return none;
+}
+
+// GETs `url` with curl, the headers in a file only this user reads, so no
+// key shows on a command line.
+fn fetch(url: str, headers: str): Json? {
+  let file = temp_path("headers");
+  var body = from_str(headers);
+  body.push_c8('\n');
+  if (!write_private(file.as_str(), body.as_str())) {
+    return none;
+  }
+  var at = from_str("@");
+  at.push_str(file.as_str());
+  var c = Command("curl");
+  c.arg("-s");
+  c.arg("-f");
+  c.arg("-m");
+  c.arg("15");
+  c.arg("-H");
+  c.arg(at.as_str());
+  c.arg(url);
+  let out = output_of(c, "quota");
+  let _ = delete_file(file.as_str());
+  if (let text = out) {
+    return parse(text.as_str());
+  }
+  return none;
+}

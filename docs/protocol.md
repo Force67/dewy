@@ -19,7 +19,7 @@ The orchestrator sends turns, stops, and watches. A turn for a task that is busy
 {"type":"watch","task":"8","session":"d0806beb-…"}
 ```
 
-The worker reports entries, the agent's session id, a task's title, the end of a turn, the Claude Code sessions running in terminals when that list changes, and every fifteen seconds its stats:
+The worker reports entries, the agent's session id, a task's title, the end of a turn, the Claude Code sessions running in terminals when that list changes, the usage meters it measured (see `docs/adr/0005-usage-limits.md`), and every fifteen seconds its stats:
 
 ```json
 {"type":"entry","task":"7","entry":{"id":"t3.toolu_01","kind":"tool","tool":"Bash","detail":"npm test","state":"running","at":1790711758562}}
@@ -28,6 +28,7 @@ The worker reports entries, the agent's session id, a task's title, the end of a
 {"type":"state","task":"7","state":"idle"}
 {"type":"title","task":"8","title":"Android app flash test"}
 {"type":"sessions","sessions":[{"id":"d0806beb-…","pid":112882,"project":"/home/me/Projects/dewy","name":"dewy-c4","state":"idle","started":1790758900000}]}
+{"type":"usage","meters":[{"agent":"codex","provider":"openai","plan":"prolite","at":1790779257882,"limits":[{"name":"7 days","used":0.78,"resets":1791143267000}],"spend":[]}]}
 {"type":"stats","stats":{"load":0.8,"cpus":16,"memTotal":67345383424,"memUsed":23318081536,"uptime":42022}}
 ```
 

@@ -58,6 +58,7 @@ import dev.dewy.newtask.NewTaskSheet
 import dev.dewy.settings.Connection
 import dev.dewy.settings.ConnectionSettings
 import dev.dewy.settings.SettingsScreen
+import dev.dewy.usage.UsageScreen
 import dev.dewy.sidebar.FoldersScreen
 import dev.dewy.tasks.Board
 import dev.dewy.tasks.Folder
@@ -199,6 +200,7 @@ private class Screens(
                 onFolder = { f -> if (wide) openFolder(f) else stack.add(Route.Tasks(f)) },
                 onBox = { openDetail(Route.BoxInfo(it)) },
                 onSettings = { openDetail(Route.Settings) },
+                onUsage = { openDetail(Route.Usage) },
                 onCompose = { compose(Draft()) },
             )
             is Route.Tasks -> TaskListScreen(
@@ -237,6 +239,7 @@ private class Screens(
                 onAttach = attach,
             )
             Route.Settings -> SettingsScreen(settings, board, onBack)
+            Route.Usage -> UsageScreen(board.boxes, settings, onBack)
         }
     }
 }

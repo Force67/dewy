@@ -45,6 +45,7 @@ pub struct Crew {
   pub fn collect(var self&): Vector<String>;
   pub fn put_back(var self&, lines: Vector<String>): ();
   pub fn running_tasks(self&): Json;
+  pub fn share_outbox(self&): SharedPointer<Mutex<Outbox>>;
   fn start(var self&, o: TurnOrder): ();
   fn watch(var self&, task: str, session: str): ();
   fn stop(var self&, task: str): ();
@@ -54,7 +55,7 @@ pub struct Crew {
 }
 
 fn Crew::Crew(yolo: bool): Crew => Crew {
-  outbox: make_shared(Mutex::<Outbox>(Outbox { lines: new::<String>(), ended: new::<Ended>() })),
+  outbox: make_shared(Mutex::<Outbox>(Outbox { lines: new::<String>(), ended: new::<Ended>(), measured: String() })),
   running: new::<Running>(), waiting: new::<TurnOrder>(), sessions: new::<Session>(), yolo
 };
 
@@ -161,6 +162,9 @@ fn Crew::stop(var self&, task: str): () {
 // lines to send.
 fn Crew::collect(var self&): Vector<String> {
   let (lines, ended) = self.outbox.get().with(fn(o: &var Outbox): (Vector<String>, Vector<Ended>) {
+    if (!o.measured.is_empty()) {
+      o.lines.push(replace(o.measured, String()));
+    }
     return (replace(o.lines, new::<String>()), replace(o.ended, new::<Ended>()));
   });
   var list = ended;
@@ -211,6 +215,8 @@ fn Crew::put_back(var self&, lines: Vector<String>): () {
     o.lines = all;
   });
 }
+
+fn Crew::share_outbox(self&): SharedPointer<Mutex<Outbox>> => self.outbox.share();
 
 fn Crew::running_tasks(self&): Json {
   var out = array();

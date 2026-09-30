@@ -7,7 +7,7 @@ module worker::turn;
 import {String, from_str, with_nul} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
 import {spawn_error_message, exit_code} from akibase::process::child;
-import {Json, parse, object, set, text, to_string} from akibase::text::json;
+import {Json, parse, object, array, push, set, text, to_string} from akibase::text::json;
 import {SharedPointer} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
 import {Atomic} from akibase::atomic;
@@ -20,6 +20,7 @@ import {system_now} from akibase::time::time;
 import {trim} from akibase::strings::string_search;
 import {clip} from wire::clip;
 import {said, entry_message} from worker::entry;
+import {usage_message} from worker::usage;
 import {Transcript} from worker::transcript;
 import {make_fifo} from worker::fifo;
 import {claude_command, claude_input, read_claude} from worker::claude_code;
@@ -52,6 +53,9 @@ pub struct Outbox : Send {
   // JSON lines for the orchestrator.
   pub var lines: Vector<String>
   pub var ended: Vector<Ended>
+  // The newest measured usage line not yet sent; a newer one replaces it,
+  // so a worker cut off for days does not pile them up.
+  pub var measured: String
 }
 
 // An image for the turn's prompt, its data in base64.
@@ -262,6 +266,12 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
       Agent::Codex => read_codex(t, j),
       Agent::OpenCode => read_opencode(t, j),
     };
+    if (!t.usage.is_empty()) {
+      var meters = array();
+      push(meters, parse(t.usage.as_str())!);
+      post(job.outbox, usage_message(meters));
+      t.usage = String();
+    }
     if (!t.session.eq(session)) {
       session = t.session.clone();
       post(job.outbox, session_message(task, session.as_str()));

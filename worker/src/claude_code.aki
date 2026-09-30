@@ -12,6 +12,8 @@ import {str_of, bool_of} from wire::fields;
 import {first_line} from wire::clip;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
+import {claude_meter} from worker::usage;
+import {unix_time_milliseconds} from akibase::time::time;
 
 // With `on_stdin`, the prompt comes as a stream-json user message on
 // standard input, which is how images reach Claude.
@@ -68,6 +70,10 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
         with_images(done, images_in(get(b, "content") ?? Json::Null));
         out.push(done);
       }
+    }
+  } else if (kind == "rate_limit_event") {
+    if (let m = claude_meter(line, unix_time_milliseconds())) {
+      t.usage = to_string(m.to_json());
     }
   } else if (kind == "result") {
     if (bool_of(line, "is_error") ?? false) {

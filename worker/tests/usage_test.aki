@@ -1,0 +1,91 @@
+// Real answers from Claude, Codex, opencode, and Z.ai, trimmed, through the
+// meter parsers. Copilot's follows its known shape.
+
+module usage_test;
+
+import {parse, to_string} from akibase::text::json;
+import {contains} from akibase::strings::string_search;
+import {eprintln} from akibase::logging;
+import {meter, claude_meter, claude_usage_meter, codex_meter, opencode_meters, add_zai, add_copilot, iso_millis} from worker::usage;
+
+comptime let kClaude: str = r"""
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1790794800,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.03,"resetsAt":1790794800},"seven_day":{"utilization":0.43,"resetsAt":1791072000}}},"session_id":"0e82"}
+""";
+
+comptime let kAnthropic: str = r"""
+{"five_hour":{"utilization":7.0,"resets_at":"2026-09-30T19:00:00.109876+00:00","limit_dollars":null},"seven_day":{"utilization":44.0,"resets_at":"2026-10-04T00:00:00.109897+00:00"},"seven_day_opus":null,"nimbus_quill":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":false,"utilization":null}}
+""";
+
+comptime let kCodex: str = r"""
+{"timestamp":"2026-09-30T14:36:19.989Z","ordinal":1353,"type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":73.0,"window_minutes":10080,"resets_at":1791143267},"secondary":{"used_percent":12.0,"window_minutes":300,"resets_at":1790790000},"plan_type":"prolite"}}}
+""";
+
+comptime let kSpend: str = r"""
+[{"provider":"opencode-go","c5h":0.00204411,"t5h":23537,"c7d":0.00204411,"t7d":23537,"c30d":4.135515058,"t30d":101995173},{"provider":"zai-coding-plan","c5h":0,"t5h":0,"c7d":0,"t7d":0,"c30d":0,"t30d":77166381}]
+""";
+
+comptime let kZai: str = r"""
+{"code":200,"msg":"Operation successful","data":{"limits":[{"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":46,"nextResetTime":1790791570699},{"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":49,"nextResetTime":1791023122984},{"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":64,"remaining":936,"percentage":6,"nextResetTime":1790787386998}],"level":"pro"},"success":true}
+""";
+
+comptime let kCopilot: str = r"""
+{"copilot_plan":"individual","quota_reset_date":"2026-10-01","quota_snapshots":{"premium_interactions":{"entitlement":300,"remaining":225,"percent_remaining":75.0,"unlimited":false}}}
+""";
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+
+  let c = to_string(claude_meter(parse(kClaude)!, 5)!.to_json());
+  // akibase reads 0.03 as 0.030000000000000006, so numbers match by prefix.
+  check(contains(c.as_str(), "{\"agent\":\"claude\",\"provider\":\"anthropic\",\"plan\":\"\",\"at\":5,\"limits\":[{\"name\":\"5 hours\",\"used\":0.03"),
+        "claude five hours", failures);
+  check(contains(c.as_str(), "\"resets\":1790794800000},{\"name\":\"7 days\",\"used\":0.43"), "claude seven days", failures);
+
+  let a = to_string(claude_usage_meter(parse(kAnthropic)!, 9)!.to_json());
+  check(contains(a.as_str(), "\"limits\":[{\"name\":\"5 hours\",\"used\":0.07"), "anthropic five hours", failures);
+  check(contains(a.as_str(), "\"resets\":1790794800109},{\"name\":\"7 days\",\"used\":0.44"), "anthropic seven days", failures);
+  check(!contains(a.as_str(), "nimbus"), "code names stay out", failures);
+  check(claude_usage_meter(parse("{\"error\":{}}")!, 9) == none, "an answer without windows", failures);
+
+  let x = codex_meter(parse(kCodex)!)!;
+  check(x.at == 1790778979989, "codex line time", failures);
+  let xs = to_string(x.to_json());
+  check(contains(xs.as_str(), "\"plan\":\"prolite\""), "codex plan", failures);
+  check(contains(xs.as_str(), "{\"name\":\"7 days\",\"used\":0.73,\"resets\":1791143267000}"), "codex weekly", failures);
+  check(contains(xs.as_str(), "{\"name\":\"5 hours\",\"used\":0.12,\"resets\":1790790000000}"), "codex five hours", failures);
+  check(codex_meter(parse("{\"payload\":{\"rate_limits\":{\"primary\":null,\"secondary\":null}}}")!) == none,
+        "codex without windows", failures);
+
+  let meters = opencode_meters(parse(kSpend)!, 7);
+  check(meters.len() == 2, "a meter per provider", failures);
+  let go = to_string(meters[0].to_json());
+  check(contains(go.as_str(), "\"provider\":\"opencode-go\""), "provider", failures);
+  check(contains(go.as_str(), "{\"name\":\"30 days\",\"cost\":4.1355150"), "monthly spend", failures);
+
+  var z = meter("opencode", "zai-coding-plan", "", 7);
+  add_zai(z, parse(kZai)!);
+  let zs = to_string(z.to_json());
+  check(contains(zs.as_str(), "\"plan\":\"pro\""), "zai plan", failures);
+  check(contains(zs.as_str(), "{\"name\":\"tokens, 5 hours\",\"used\":0.46,\"resets\":1790791570699}"), "zai five hours", failures);
+  check(contains(zs.as_str(), "{\"name\":\"tokens, 1 week\",\"used\":0.49,"), "zai week", failures);
+  check(contains(zs.as_str(), "{\"name\":\"tool calls, 1 month\",\"used\":0.06,"), "zai tool calls", failures);
+
+  var g = meter("opencode", "github-copilot", "", 7);
+  add_copilot(g, parse(kCopilot)!);
+  let gs = to_string(g.to_json());
+  check(contains(gs.as_str(), "{\"name\":\"premium requests\",\"used\":0.25,\"resets\":1790812800000}"), "copilot premium", failures);
+  var none_left = meter("opencode", "github-copilot", "", 7);
+  add_copilot(none_left, parse("{\"copilot_plan\":\"individual\",\"access_type_sku\":\"no_access\"}")!);
+  check(none_left.limits.len() == 0, "copilot without a plan", failures);
+
+  check(iso_millis("1970-01-02") == 86400000, "a date", failures);
+  check(iso_millis("nope") == none, "not a date", failures);
+  return failures;
+}

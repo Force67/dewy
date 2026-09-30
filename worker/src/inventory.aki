@@ -34,7 +34,7 @@ fn os_name(): String {
   return from_str("Linux");
 }
 
-fn on_path(program: str): bool {
+pub fn on_path(program: str): bool {
   let path = get_environment_variable("PATH") ?? String();
   for (let dir in split(path.as_str(), ":")) {
     if (#dir > 0 && path_exists(join(dir, program).as_str())) {

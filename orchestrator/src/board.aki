@@ -86,6 +86,9 @@ pub struct Box : Send {
   pub var projects: String
   // JSON text: the models the box lists, by agent.
   pub var models: String
+  // JSON text: the box's meters, one per agent and provider (see
+  // docs/adr/0005-usage-limits.md).
+  pub var usage: String
   pub var stats: String
   // JSON text: the Claude Code sessions running in terminals on the box, as
   // the worker last listed them.
@@ -379,6 +382,42 @@ fn Board::set_model(var self&, id: str, model: str, now: i64): () ! Refusal {
   return ();
 }
 
+fn same_meter(a&: Json, b&: Json): bool =>
+  (str_of(a, "agent") ?? "") == (str_of(b, "agent") ?? "") && (str_of(a, "provider") ?? "") == (str_of(b, "provider") ?? "");
+
+// The box's meters with those of a usage line in place of the ones for the
+// same agent and provider.
+fn merge_meters(known: str, msg&: Json): String {
+  let fresh = as_array(get(msg, "meters") ?? Json::Null) else {
+    return from_str(known);
+  };
+  var out = array();
+  if (let old = as_array(parse(known) ?? Json::Null)) {
+    for (let m& in old) {
+      var replaced = false;
+      for (let f& in fresh) {
+        if (same_meter(m, f)) {
+          replaced = true;
+        }
+      }
+      if (!replaced) {
+        push(out, copy(m));
+      }
+    }
+  }
+  for (let f& in fresh) {
+    push(out, copy(f));
+  }
+  return to_string(out);
+}
+
+fn usage_text(j&: Json): String {
+  if (let list = as_array(get(j, "usage") ?? Json::Null)) {
+    return to_string(copy(get(j, "usage")!));
+  }
+  return from_str("[]");
+}
+
 // A hello or saved box from before models were listed has none.
 fn models_text(j&: Json): String {
   if (let m = get(j, "models")) {
@@ -418,7 +457,7 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   if (b == self.boxes.len()) {
     self.boxes.push(Box {
       name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
-      models: from_str("{}"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
+      models: from_str("{}"), usage: from_str("[]"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
     });
   }
   self.boxes[b].host = string_of(hello, "host");
@@ -462,6 +501,13 @@ fn Board::detach(var self&, name: str, now: i64): () {
 // the box's stats.
 fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
   let kind = str_of(msg, "type") ?? "";
+  if (kind == "usage") {
+    if (let b = self.find_box(box_name)) {
+      self.boxes[b].usage = merge_meters(self.boxes[b].usage.as_str(), msg);
+      self.touch_box(b);
+    }
+    return;
+  }
   if (kind == "stats") {
     if (let b = self.find_box(box_name)) {
       self.boxes[b].stats = to_string(get(msg, "stats") ?? Json::Null);
@@ -671,6 +717,7 @@ fn box_json(b&: Box): Json {
   set(o, "agents", parse(b.agents.as_str()) ?? array());
   set(o, "projects", parse(b.projects.as_str()) ?? array());
   set(o, "models", parse(b.models.as_str()) ?? object());
+  set(o, "usage", parse(b.usage.as_str()) ?? array());
   set(o, "stats", parse(b.stats.as_str()) ?? object());
   set(o, "sessions", parse(b.sessions.as_str()) ?? array());
   return o;
@@ -741,7 +788,7 @@ fn Board::restore_box(var self&, j&: Json): () {
   self.boxes.push(Box {
     name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
     agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
-    models: models_text(j), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
+    models: models_text(j), usage: usage_text(j), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
     outbox: new::<String>()
   });
 }

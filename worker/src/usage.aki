@@ -1,0 +1,266 @@
+// Meters: what the box knows about one agent's provider and its limits,
+// read from what each agent leaves behind. See docs/adr/0005-usage-limits.md.
+//
+//   {"agent", "provider", "plan", "at",
+//    "limits": [{"name", "used", "resets"}], "spend": [{"name", "cost", "tokens"}]}
+//
+// `used` is a fraction; `at` and `resets` are Unix milliseconds, `resets`
+// 0 when unknown. Only parsing lives here; worker::measure does the I/O.
+
+module worker::usage;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Json, object, array, set, push, text, number, get, as_array, path} from akibase::text::json;
+import {replace_all} from akibase::strings::string_util;
+import {parse_i64} from akibase::strings::string_to_number;
+import {str_of, num_of, bool_of, copy} from wire::fields;
+
+pub struct Meter {
+  pub var agent: String
+  pub var provider: String
+  pub var plan: String
+  pub var at: i64
+  pub var limits: Vector<Json>
+  pub var spend: Vector<Json>
+
+  pub fn to_json(self&): Json;
+}
+
+pub fn meter(agent: str, provider: str, plan: str, at: i64): Meter => Meter {
+  agent: from_str(agent), provider: from_str(provider), plan: from_str(plan), at, limits: new::<Json>(),
+  spend: new::<Json>()
+};
+
+fn Meter::to_json(self&): Json {
+  var m = object();
+  set(m, "agent", text(self.agent.as_str()));
+  set(m, "provider", text(self.provider.as_str()));
+  set(m, "plan", text(self.plan.as_str()));
+  set(m, "at", number(self.at as f64));
+  var limits = array();
+  for (let l& in self.limits) {
+    push(limits, copy(l));
+  }
+  set(m, "limits", limits);
+  var spend = array();
+  for (let x& in self.spend) {
+    push(spend, copy(x));
+  }
+  set(m, "spend", spend);
+  return m;
+}
+
+pub fn limit(name: str, used: f64, resets: i64): Json {
+  var l = object();
+  set(l, "name", text(name));
+  set(l, "used", number(used));
+  set(l, "resets", number(resets as f64));
+  return l;
+}
+
+pub fn usage_message(meters: Json): Json {
+  var msg = object();
+  set(msg, "type", text("usage"));
+  set(msg, "meters", meters);
+  return msg;
+}
+
+// "five_hour" reads as "5 hours".
+fn window_name(key: str): String => match (key) {
+  "five_hour" => from_str("5 hours"),
+  "seven_day" => from_str("7 days"),
+  "seven_day_opus" => from_str("7 days, Opus"),
+  "seven_day_sonnet" => from_str("7 days, Sonnet"),
+  _ => replace_all(key, "_", " "),
+};
+
+// The windows of Anthropic's usage answer worth showing; the others are
+// code names or empty.
+comptime let kClaudeWindows: [str; 4] = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"];
+
+// Anthropic's OAuth usage answer, as Claude Code's /usage reads it:
+// {"five_hour": {"utilization": 7.0, "resets_at": "<ISO>"}, …}, in percent.
+pub fn claude_usage_meter(answer&: Json, at: i64): Meter? {
+  var m = meter("claude", "anthropic", "", at);
+  for (let key in kClaudeWindows) {
+    if (let w = get(answer, key)) {
+      if (let used = num_of(w, "utilization")) {
+        let resets = iso_millis(str_of(w, "resets_at") ?? "") ?? 0;
+        m.limits.push(limit(window_name(key).as_str(), used / 100.0, resets));
+      }
+    }
+  }
+  if (m.limits.is_empty()) {
+    return none;
+  }
+  return m;
+}
+
+// Claude's `rate_limit_event`: a limit per window it names.
+pub fn claude_meter(event&: Json, at: i64): Meter? {
+  let windows = path(event, "rate_limit_info.unifiedWindows") else {
+    return none;
+  };
+  var m = meter("claude", "anthropic", "", at);
+  match (windows) {
+    Json::Obj(let members&) => {
+      for (let w& in members) {
+        let used = num_of(w.value, "utilization") ?? 0.0;
+        let resets = (num_of(w.value, "resetsAt") ?? 0.0) as i64 * 1000;
+        m.limits.push(limit(window_name(w.key.as_str()).as_str(), used, resets));
+      }
+    }
+    _ => {
+      return none;
+    }
+  }
+  return m;
+}
+
+// 300 minutes read as "5 hours", 10080 as "7 days".
+fn minutes_name(minutes: i64): String {
+  var name = String();
+  if (minutes > 0 && minutes % 1440 == 0) {
+    name.push_i64(minutes / 1440);
+    name.push_str(minutes == 1440 ? " day" : " days");
+  } else {
+    name.push_i64((minutes + 59) / 60);
+    name.push_str(minutes <= 60 ? " hour" : " hours");
+  }
+  return name;
+}
+
+// A Codex rollout line carrying `rate_limits`, with the time it was written.
+pub fn codex_meter(line&: Json): Meter? {
+  let limits = path(line, "payload.rate_limits") else {
+    return none;
+  };
+  let at = iso_millis(str_of(line, "timestamp") ?? "") ?? 0;
+  var m = meter("codex", "openai", str_of(limits, "plan_type") ?? "", at);
+  var any = false;
+  for (let key in ["primary", "secondary"]) {
+    if (let w = get(limits, key)) {
+      if (let used = num_of(w, "used_percent")) {
+        let minutes = (num_of(w, "window_minutes") ?? 0.0) as i64;
+        let resets = (num_of(w, "resets_at") ?? 0.0) as i64 * 1000;
+        m.limits.push(limit(minutes_name(minutes).as_str(), used / 100.0, resets));
+        any = true;
+      }
+    }
+  }
+  if (!any) {
+    return none;
+  }
+  return m;
+}
+
+// The windows opencode's spend is summed over, as the query names them.
+pub comptime let kSpendWindows: [(str, str, i64); 3] = [
+  ("5 hours", "5h", 18000000),
+  ("7 days", "7d", 604800000),
+  ("30 days", "30d", 2592000000),
+];
+
+// The rows of the spend query: one per provider, with c<window> and
+// t<window> columns.
+pub fn opencode_meters(rows&: Json, at: i64): Vector<Meter> {
+  var out = new::<Meter>();
+  let list = as_array(rows) else {
+    return out;
+  };
+  for (let row& in list) {
+    let provider = str_of(row, "provider") ?? "";
+    if (#provider == 0) {
+      continue;
+    }
+    var m = meter("opencode", provider, "", at);
+    for (let (name, column, _) in kSpendWindows) {
+      var s = object();
+      set(s, "name", text(name));
+      set(s, "cost", number(num_of(row, f"c{column}".as_str()) ?? 0.0));
+      set(s, "tokens", number(num_of(row, f"t{column}".as_str()) ?? 0.0));
+      m.spend.push(s);
+    }
+    out.push(m);
+  }
+  return out;
+}
+
+fn unit_name(unit: i64, n: i64): String {
+  var name = String();
+  name.push_i64(n);
+  name.push_str(match (unit) {
+    3 => n == 1 ? " hour" : " hours",
+    5 => n == 1 ? " month" : " months",
+    6 => n == 1 ? " week" : " weeks",
+    _ => "",
+  });
+  return name;
+}
+
+// Z.ai's quota answer: token and tool call limits per window.
+pub fn add_zai(var m&: Meter, answer&: Json): () {
+  let data = get(answer, "data") else {
+    return;
+  };
+  m.plan = from_str(str_of(data, "level") ?? "");
+  let limits = as_array(get(data, "limits") ?? Json::Null) else {
+    return;
+  };
+  for (let l& in limits) {
+    let kind = str_of(l, "type") ?? "";
+    var name = from_str(kind == "TIME_LIMIT" ? "tool calls, " : "tokens, ");
+    name.push_str(unit_name((num_of(l, "unit") ?? 0.0) as i64, (num_of(l, "number") ?? 0.0) as i64).as_str());
+    let used = (num_of(l, "percentage") ?? 0.0) / 100.0;
+    m.limits.push(limit(name.as_str(), used, (num_of(l, "nextResetTime") ?? 0.0) as i64));
+  }
+}
+
+// GitHub Copilot's user answer: the premium requests left this month.
+pub fn add_copilot(var m&: Meter, answer&: Json): () {
+  m.plan = from_str(str_of(answer, "copilot_plan") ?? "");
+  let premium = path(answer, "quota_snapshots.premium_interactions") else {
+    return;
+  };
+  if (bool_of(premium, "unlimited") ?? false) {
+    return;
+  }
+  let left = num_of(premium, "percent_remaining") else {
+    return;
+  };
+  let resets = iso_millis(str_of(answer, "quota_reset_date_utc") ?? str_of(answer, "quota_reset_date") ?? "") ?? 0;
+  m.limits.push(limit("premium requests", 1.0 - left / 100.0, resets));
+}
+
+// "2026-09-30T14:36:19.989Z" or "2026-10-01" as Unix milliseconds, in UTC.
+pub fn iso_millis(s: str): i64? {
+  if (#s < 10 || s[4..5] != "-" || s[7..8] != "-") {
+    return none;
+  }
+  let y = parse_i64(s[0..4]) else { return none; };
+  let mo = parse_i64(s[5..7]) else { return none; };
+  let d = parse_i64(s[8..10]) else { return none; };
+  var secs: i64 = 0;
+  if (#s >= 19 && s[10..11] == "T") {
+    let h = parse_i64(s[11..13]) else { return none; };
+    let mi = parse_i64(s[14..16]) else { return none; };
+    let se = parse_i64(s[17..19]) else { return none; };
+    secs = h * 3600 + mi * 60 + se;
+  }
+  var ms: i64 = 0;
+  if (#s >= 23 && s[19..20] == ".") {
+    ms = parse_i64(s[20..23]) ?? 0;
+  }
+  return (days_from_civil(y, mo, d) * 86400 + secs) * 1000 + ms;
+}
+
+// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's).
+fn days_from_civil(y0: i64, m: i64, d: i64): i64 {
+  let y = m <= 2 ? y0 - 1 : y0;
+  let era = (y >= 0 ? y : y - 399) / 400;
+  let yoe = y - era * 400;
+  let doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}

@@ -22,6 +22,7 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.Computer
+import androidx.compose.material.icons.rounded.DataUsage
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.Inbox
@@ -56,6 +57,7 @@ fun FoldersScreen(
     onFolder: (Folder) -> Unit,
     onBox: (String) -> Unit,
     onSettings: () -> Unit,
+    onUsage: () -> Unit,
     onCompose: () -> Unit,
 ) {
     val p = LocalPalette.current
@@ -137,6 +139,8 @@ fun FoldersScreen(
         }
         item {
             Group(null, Modifier.padding(top = 22.dp)) {
+                GroupRow("Usage", icon = Icons.Rounded.DataUsage, iconTint = p.inkSoft, onClick = onUsage)
+                Hairline(52.dp)
                 GroupRow("Settings", icon = Icons.Outlined.Settings, iconTint = p.inkSoft, onClick = onSettings)
             }
         }
