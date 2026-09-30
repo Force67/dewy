@@ -26,17 +26,17 @@ pub fn main(): i32 {
   var b = Board();
   let hello = parse("{\"type\":\"hello\",\"box\":\"forge\",\"host\":\"forge.lan\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[]}")!;
 
-  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", 1000)) {
+  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", false, 1000)) {
     check(false, "an unknown box takes no task", failures);
   } else (let e) {
     check(e == Refusal::NoSuchBox, "unknown box", failures);
   }
 
   let _ = b.attach(hello, 1000);
-  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", 1000)) {
+  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", false, 1000)) {
     check(false, "an agent the box lacks is refused", failures);
   }
-  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", 1000)!;
+  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", false, 1000)!;
   check(id.as_str() == "1", "ids count up", failures);
 
   let out = b.take_outbox("forge");
@@ -77,7 +77,7 @@ pub fn main(): i32 {
   check(task_state(b, "1").as_str() == "failed", "a lost turn fails", failures);
 
   // A session running in a terminal, as the worker lists it.
-  if (let _ = b.attach_session("forge", "s-1", 800000)) {
+  if (let _ = b.attach_session("forge", "s-1", false, 800000)) {
     check(false, "an unlisted session is refused", failures);
   } else (let e) {
     check(e == Refusal::NoSuchSession, "unlisted session", failures);
@@ -85,17 +85,26 @@ pub fn main(): i32 {
   b.apply("forge", parse("{\"type\":\"sessions\",\"sessions\":[{\"id\":\"s-1\",\"pid\":42,\"project\":\"/src/rx\",\"name\":\"rx-de\",\"state\":\"working\"}]}")!, 800001);
   check(contains(to_string(b.boxes_json()).as_str(), "\"name\":\"rx-de\""), "the box shows its sessions", failures);
   let _ = b.take_outbox("forge");
-  let watched = b.attach_session("forge", "s-1", 800002)!;
+  let watched = b.attach_session("forge", "s-1", false, 800002)!;
   let w = to_string(b.task_json(watched.as_str())!);
   check(contains(w.as_str(), "\"project\":\"/src/rx\"") && contains(w.as_str(), "\"session\":\"s-1\""), "the task takes the session", failures);
   check(task_state(b, watched.as_str()).as_str() == "working", "a busy session is working", failures);
   let watch = b.take_outbox("forge");
   check(watch.len() == 1 && contains(watch[0].as_str(), "\"type\":\"watch\""), "the worker is told to watch", failures);
-  check((b.attach_session("forge", "s-1", 800003)!).eq(watched), "attaching again finds the task", failures);
+  check((b.attach_session("forge", "s-1", false, 800003)!).eq(watched), "attaching again finds the task", failures);
   check(b.take_outbox("forge").len() == 1, "and asks the worker to watch again", failures);
 
   b.apply("forge", parse("{\"type\":\"title\",\"task\":\"2\",\"title\":\"Rust port\"}")!, 800004);
   check(contains(to_string(b.task_json(watched.as_str())!).as_str(), "\"title\":\"Rust port\""), "the worker names the task", failures);
+
+  let _ = b.take_outbox("forge");
+  let wild = b.create_task("forge", "/src/dewy", "claude", "go", true, 850000)!;
+  let turns = b.take_outbox("forge");
+  check(turns.len() == 1 && contains(turns[0].as_str(), "\"yolo\":true"), "a yolo task's turn says so", failures);
+  let _ = b.steer(wild.as_str(), "again", 850001);
+  let later = b.take_outbox("forge");
+  check(later.len() == 1 && contains(later[0].as_str(), "\"yolo\":true"), "and so does every later turn", failures);
+  check(contains(to_string(b.task_json(wild.as_str())!).as_str(), "\"yolo\":true"), "the task shows it", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

@@ -64,6 +64,8 @@ pub struct Task : Send {
   pub var activity: String
   pub var state: TaskState
   pub var archived: bool
+  // Its turns run without asking for permissions.
+  pub var yolo: bool
   pub var created: i64
   pub var updated: i64
   pub var turns: u32
@@ -105,8 +107,8 @@ pub struct Board : Send {
 
   pub fn Board(): Board;
   pub fn last_seq(self&): u64;
-  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, now: i64): String ! Refusal;
-  pub fn attach_session(var self&, box_name: str, session: str, now: i64): String ! Refusal;
+  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, yolo: bool, now: i64): String ! Refusal;
+  pub fn attach_session(var self&, box_name: str, session: str, yolo: bool, now: i64): String ! Refusal;
   pub fn steer(var self&, id: str, prompt: str, now: i64): () ! Refusal;
   pub fn stop(var self&, id: str, now: i64): () ! Refusal;
   pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
@@ -179,7 +181,7 @@ fn listed(obj&: Json, key: str, value: str): bool {
   return has_text(list, value);
 }
 
-fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, now: i64): String ! Refusal {
+fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, yolo: bool, now: i64): String ! Refusal {
   let b = self.find_box(box_name) else {
     return fail Refusal::NoSuchBox;
   };
@@ -198,7 +200,7 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
   self.tasks.push(Task {
     id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent),
     title: from_str(first_line(prompt, 120)), session: String(), preview: String(), activity: String(),
-    state: TaskState::Working, archived: false, created: now, updated: now, turns: 0, entries: new::<String>(),
+    state: TaskState::Working, archived: false, yolo, created: now, updated: now, turns: 0, entries: new::<String>(),
     entry_ids: new::<String>()
   });
   self.send_turn(self.tasks.len() - 1, prompt, now);
@@ -210,7 +212,7 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
 // mirrors the session into it. Attaching again returns the same task and
 // asks again, for a worker that lost its watch; one still watching
 // ignores it.
-fn Board::attach_session(var self&, box_name: str, session: str, now: i64): String ! Refusal {
+fn Board::attach_session(var self&, box_name: str, session: str, yolo: bool, now: i64): String ! Refusal {
   let b = self.find_box(box_name) else {
     return fail Refusal::NoSuchBox;
   };
@@ -250,7 +252,7 @@ fn Board::attach_session(var self&, box_name: str, session: str, now: i64): Stri
   self.tasks.push(Task {
     id: id.clone(), box_name: from_str(box_name), project: string_of(s, "project"), agent: from_str("claude"),
     title, session: from_str(session), preview: String(), activity: String(),
-    state: working ? TaskState::Working : TaskState::Idle, archived: false, created: now, updated: now, turns: 0,
+    state: working ? TaskState::Working : TaskState::Idle, archived: false, yolo, created: now, updated: now, turns: 0,
     entries: new::<String>(), entry_ids: new::<String>()
   });
   self.touch_task(self.tasks.len() - 1);
@@ -301,6 +303,7 @@ fn Board::send_turn(var self&, i: usize, prompt: str, now: i64): () {
   set(msg, "project", text(self.tasks[i].project.as_str()));
   set(msg, "session", text(self.tasks[i].session.as_str()));
   set(msg, "text", text(prompt));
+  set(msg, "yolo", boolean(self.tasks[i].yolo));
   if (let b = self.find_box(self.tasks[i].box_name.as_str())) {
     self.boxes[b].outbox.push(to_string(msg));
   }
@@ -569,6 +572,7 @@ fn summary_json(t&: Task): Json {
   set(o, "activity", text(t.activity.as_str()));
   set(o, "state", text(state_name(t.state)));
   set(o, "archived", boolean(t.archived));
+  set(o, "yolo", boolean(t.yolo));
   set(o, "created", number(t.created as f64));
   set(o, "updated", number(t.updated as f64));
   set(o, "turns", number(t.turns as f64));
@@ -644,7 +648,7 @@ fn Board::restore_task(var self&, j&: Json): () {
   self.tasks.push(Task {
     id, box_name: string_of(j, "box"), project: string_of(j, "project"), agent: string_of(j, "agent"),
     title: string_of(j, "title"), session: string_of(j, "session"), preview: string_of(j, "preview"),
-    activity: String(), state, archived: bool_of(j, "archived") ?? false,
+    activity: String(), state, archived: bool_of(j, "archived") ?? false, yolo: bool_of(j, "yolo") ?? false,
     created: (num_of(j, "created") ?? 0.0) as i64, updated: (num_of(j, "updated") ?? 0.0) as i64,
     turns: (num_of(j, "turns") ?? 0.0) as u32, entries, entry_ids
   });

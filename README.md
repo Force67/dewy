@@ -50,7 +50,8 @@ Enter the orchestrator's address and token on first launch.
 ## Things to know
 
 - Everything is plain HTTP with a shared bearer token. Keep it on a private network such as a tailnet, or put a TLS proxy in front of port 8787.
-- Agents run unattended. By default Claude Code runs with `--permission-mode acceptEdits` and Codex in its `workspace-write` sandbox; commands they may not run show up in the thread as notes. `worker --yolo` lifts both limits; use it only on boxes you can wipe.
+- Agents run unattended. By default Claude Code runs with `--permission-mode acceptEdits` and Codex in its `workspace-write` sandbox; commands they may not run show up in the thread as notes. Yolo mode, switched on per task when you start it, lifts both limits; `worker --yolo` lifts them for every task on a box. Anyone with the token can start a yolo task, so keep the token to yourself.
 - A task that says nothing for three minutes while working is marked stalled, and the app offers to nudge or stop it.
+- A box's page lists the Claude Code sessions running in its terminals. Tapping one follows it as a task; replying ends it in the terminal and continues it from the phone.
 - Notifications need no Google services: while agents work, the app keeps a foreground service with a live notification that holds the event stream open. Tasks that start while the app has been closed are noticed when it next opens.
 - The worker reads `/proc` for box stats and uses named pipes, so boxes run Linux.

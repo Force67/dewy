@@ -93,6 +93,7 @@ fun Shell(
     AskForNotifications()
 
     val seen = readMarks.seen.collectAsStateWithLifecycle(emptyMap())
+    val yolo by settings.yolo.collectAsStateWithLifecycle(false)
     val scope = rememberCoroutineScope()
     val stack = rememberNavBackStack(Route.Folders, Route.Tasks(Folder.All))
     var composing by rememberSaveable { mutableStateOf(false) }
@@ -120,7 +121,7 @@ fun Shell(
         },
         archive = { task, archived -> scope.launch { runCatching { store.archive(task.id, archived) } } },
         attach = { box, session ->
-            scope.launch { runCatching { store.attachSession(box, session) }.onSuccess { openDetail(Route.Thread(it.id)) } }
+            scope.launch { runCatching { store.attachSession(box, session, yolo) }.onSuccess { openDetail(Route.Thread(it.id)) } }
         },
     )
 
@@ -132,6 +133,8 @@ fun Shell(
         NewTaskSheet(
             boxes = board.boxes,
             draft = draft,
+            yolo = yolo,
+            onYolo = { on -> scope.launch { settings.setYolo(on) } },
             onStart = store::startTask,
             onStarted = { task ->
                 composing = false

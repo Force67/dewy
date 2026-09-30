@@ -79,14 +79,14 @@ class TaskStore(connection: Flow<Connection?>, private val scope: CoroutineScope
         threads.update { it + (id to loaded) }
     }
 
-    suspend fun startTask(box: String, project: String, agent: String, text: String): Task {
-        val task = requireClient().startTask(box, project, agent, text)
+    suspend fun startTask(box: String, project: String, agent: String, text: String, yolo: Boolean): Task {
+        val task = requireClient().startTask(box, project, agent, text, yolo)
         upsert(task)
         return task
     }
 
-    suspend fun attachSession(box: String, session: String): Task {
-        val task = requireClient().attachSession(box, session)
+    suspend fun attachSession(box: String, session: String, yolo: Boolean): Task {
+        val task = requireClient().attachSession(box, session, yolo)
         upsert(task)
         return task
     }

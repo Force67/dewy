@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBackIos
 import androidx.compose.material.icons.rounded.MoreHoriz
@@ -49,6 +50,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -203,6 +205,15 @@ private fun Header(t: Task) {
         Spacer(Modifier.height(6.dp))
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             StatePill(t.state)
+            if (t.yolo) {
+                Text(
+                    "Yolo",
+                    style = Type.caption,
+                    color = p.coral,
+                    modifier = Modifier.clip(RoundedCornerShape(50)).background(p.coral.copy(alpha = 0.13f))
+                        .padding(horizontal = 9.dp, vertical = 4.dp),
+                )
+            }
         }
         Spacer(Modifier.height(4.dp))
         Text(

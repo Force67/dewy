@@ -13,7 +13,7 @@ import {Atomic} from akibase::atomic;
 import {Thread, spawn} from akibase::threading::thread;
 import {send_signal, kSignalTerminate} from akibase::process::child;
 import {replace} from akibase::algorithm;
-import {str_of, string_of} from wire::fields;
+import {str_of, string_of, bool_of} from wire::fields;
 import {said, entry_message} from worker::entry;
 import {Ended, Outbox, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
 import {find_session} from worker::terminal;
@@ -81,7 +81,7 @@ fn Crew::order(var self&, msg&: Json): () {
   };
   let o = TurnOrder {
     task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
-    session: string_of(msg, "session"), text: string_of(msg, "text")
+    session: string_of(msg, "session"), text: string_of(msg, "text"), yolo: bool_of(msg, "yolo") ?? false
   };
   if (self.is_running(task)) {
     self.waiting.push(o);
@@ -104,7 +104,8 @@ fn Crew::start(var self&, o: TurnOrder): () {
   let task = order.task.clone();
   let pid = make_shared(Atomic::<i32>(0));
   let stopped = make_shared(Atomic::<i32>(0));
-  let job = TurnJob { order, yolo: self.yolo, outbox: self.outbox.share(), pid: pid.share(), stopped: stopped.share() };
+  let yolo = self.yolo || order.yolo;
+  let job = TurnJob { order, yolo, outbox: self.outbox.share(), pid: pid.share(), stopped: stopped.share() };
   let thread = spawn(run_turn, job);
   self.running.push(Running { task, pid, stopped, thread, watch: false });
 }

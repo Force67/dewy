@@ -40,22 +40,24 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
     suspend fun thread(id: String): TaskThread =
         call(request("api/tasks/$id").get().build()) { wireJson.decodeFromString(it) }
 
-    suspend fun startTask(box: String, project: String, agent: String, text: String): Task {
+    suspend fun startTask(box: String, project: String, agent: String, text: String, yolo: Boolean): Task {
         val body = buildJsonObject {
             put("box", box)
             put("project", project)
             put("agent", agent)
             put("text", text)
+            put("yolo", yolo)
         }
         return call(request("api/tasks").post(body.toString().toRequestBody(jsonType)).build()) {
             wireJson.decodeFromString(it)
         }
     }
 
-    suspend fun attachSession(box: String, session: String): Task {
+    suspend fun attachSession(box: String, session: String, yolo: Boolean): Task {
         val body = buildJsonObject {
             put("box", box)
             put("session", session)
+            put("yolo", yolo)
         }
         return call(request("api/sessions/attach").post(body.toString().toRequestBody(jsonType)).build()) {
             wireJson.decodeFromString(it)

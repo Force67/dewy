@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -31,6 +32,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -65,7 +68,9 @@ data class Draft(val box: String? = null, val project: String? = null)
 fun NewTaskSheet(
     boxes: List<DewyBox>,
     draft: Draft,
-    onStart: suspend (box: String, project: String, agent: String, text: String) -> Task,
+    yolo: Boolean,
+    onYolo: (Boolean) -> Unit,
+    onStart: suspend (box: String, project: String, agent: String, text: String, yolo: Boolean) -> Task,
     onStarted: (Task) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -83,7 +88,7 @@ fun NewTaskSheet(
     var problem by remember { mutableStateOf<String?>(null) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheet, containerColor = p.ground) {
-        Column(Modifier.fillMaxWidth().imePadding().padding(bottom = 16.dp)) {
+        Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
             Text("New Task", style = Type.title, color = p.ink, modifier = Modifier.padding(horizontal = 20.dp))
             if (online.isEmpty()) {
                 Text(
@@ -170,6 +175,27 @@ fun NewTaskSheet(
                 )
             }
 
+            Row(
+                Modifier
+                    .padding(horizontal = 16.dp)
+                    .padding(top = 12.dp)
+                    .fillMaxWidth()
+                    .clip(CardShape)
+                    .background(p.surface)
+                    .padding(start = 14.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Yolo mode", style = Type.body, color = p.ink)
+                    Text(
+                        if (yolo) "Runs any command without asking" else "Edits files; commands that need permission are refused",
+                        style = Type.caption,
+                        color = if (yolo) p.coral else p.inkSoft,
+                    )
+                }
+                Switch(checked = yolo, onCheckedChange = onYolo, colors = SwitchDefaults.colors(checkedTrackColor = p.coral))
+            }
+
             if (problem != null) {
                 Text(problem!!, style = Type.footnote, color = p.red, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
@@ -181,7 +207,7 @@ fun NewTaskSheet(
                     problem = null
                     scope.launch {
                         try {
-                            val task = onStart(box!!.name, project!!, agent!!, text.trim())
+                            val task = onStart(box!!.name, project!!, agent!!, text.trim(), yolo)
                             sheet.hide()
                             onStarted(task)
                         } catch (e: Exception) {

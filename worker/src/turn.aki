@@ -56,6 +56,8 @@ pub struct TurnOrder : Send {
   pub var project: String
   pub var session: String
   pub var text: String
+  // The task asked to run without permission prompts.
+  pub var yolo: bool
 }
 
 pub struct TurnJob : Send {

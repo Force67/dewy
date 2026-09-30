@@ -41,6 +41,8 @@ data class Task(
     val activity: String = "",
     val state: TaskState,
     val archived: Boolean = false,
+    /** Its turns run without permission prompts. */
+    val yolo: Boolean = false,
     val created: Long,
     val updated: Long,
     val turns: Int = 0,
