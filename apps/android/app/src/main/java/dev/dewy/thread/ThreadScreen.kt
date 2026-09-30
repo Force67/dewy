@@ -159,7 +159,7 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
             return@Scaffold
         }
         val items = remember(list) { timeline(list) }
-        val listState = rememberLazyListState()
+        val listState = rememberLazyListState(initialFirstVisibleItemIndex = items.size)
         // Follow new entries while the reader is at the bottom.
         LaunchedEffect(listState) {
             var lastCount = 0
