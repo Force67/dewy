@@ -1,0 +1,181 @@
+// Claude Code sessions running in terminals on this box. Claude Code keeps
+// a file per running session in ~/.claude/sessions/<pid>.json, with its
+// session id, directory, and whether it is busy, and writes the session's
+// transcript to ~/.claude/projects/<dir>/<session>.jsonl.
+
+module worker::terminal;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Json, object, array, set, push, text, number, parse} from akibase::text::json;
+import {get_environment_variable} from akibase::environment_variables;
+import {read_file, path_exists} from akibase::filesystem::file_util;
+import {list_directory} from akibase::filesystem::directory;
+import {join} from akibase::filesystem::path;
+import {split_whitespace} from akibase::strings::string_util;
+import {split_last_once, ends_with} from akibase::strings::string_search;
+import {send_signal, kSignalTerminate, kSignalKill} from akibase::process::child;
+import {milliseconds, seconds, sleep, now} from akibase::time::time;
+import {str_of, num_of, string_of} from wire::fields;
+
+pub struct TerminalSession : Send {
+  pub var id: String
+  pub var pid: i32
+  // The process's start time, which tells it from a later process that
+  // got the same pid.
+  pub var proc_start: String
+  pub var project: String
+  pub var name: String
+  pub var busy: bool
+  pub var started: f64
+}
+
+fn claude_dir(sub: str): String {
+  let home = get_environment_variable("HOME") ?? String();
+  return join(join(home.as_str(), ".claude").as_str(), sub);
+}
+
+// Field 22 of /proc/<pid>/stat, counted after the command name, which may
+// hold spaces.
+fn proc_start(pid: i32): String? {
+  var p = from_str("/proc/");
+  p.push_i64(pid as i64);
+  p.push_str("/stat");
+  let stat = read_file(p.as_str()) else {
+    return none;
+  };
+  let (_, rest) = split_last_once(stat.as_str(), ')') else {
+    return none;
+  };
+  let fields = split_whitespace(rest);
+  if (fields.len() < 20) {
+    return none;
+  }
+  return from_str(fields[19]);
+}
+
+pub fn alive(pid: i32, start: str): bool {
+  if (pid <= 0 || #start == 0) {
+    return false;
+  }
+  let now = proc_start(pid) else {
+    return false;
+  };
+  return now.as_str() == start;
+}
+
+fn read_session(path: str): TerminalSession? {
+  let body = read_file(path) else {
+    return none;
+  };
+  let j = parse(body.as_str()) else {
+    return none;
+  };
+  if ((str_of(j, "kind") ?? "") != "interactive") {
+    return none;
+  }
+  let pid = (num_of(j, "pid") ?? 0.0) as i32;
+  let start = string_of(j, "procStart");
+  if (!alive(pid, start.as_str())) {
+    return none;
+  }
+  return TerminalSession {
+    id: string_of(j, "sessionId"), pid, proc_start: start, project: string_of(j, "cwd"), name: string_of(j, "name"),
+    busy: (str_of(j, "status") ?? "") == "busy", started: num_of(j, "startedAt") ?? 0.0
+  };
+}
+
+// The sessions running now, oldest first.
+pub fn terminal_sessions(): Vector<TerminalSession> {
+  var out = new::<TerminalSession>();
+  let dir = claude_dir("sessions");
+  for (let name& in list_directory(dir.as_str()) ?? new::<String>()) {
+    if (!ends_with(name.as_str(), ".json")) {
+      continue;
+    }
+    if (let s = read_session(join(dir.as_str(), name.as_str()).as_str())) {
+      var at = out.len();
+      while (at > 0 && out[at - 1].started > s.started) {
+        at -= 1;
+      }
+      out.insert(at, s);
+    }
+  }
+  return out;
+}
+
+pub fn find_session(id: str): TerminalSession? {
+  var list = terminal_sessions();
+  while (list.len() > 0) {
+    let s = list.remove(0);
+    if (s.id.as_str() == id) {
+      return s;
+    }
+  }
+  return none;
+}
+
+// What the session's process says about itself now. None when its file
+// cannot be read at the moment, which does not mean the process ended.
+pub fn reread(s&: TerminalSession): TerminalSession? {
+  var name = String();
+  name.push_i64(s.pid as i64);
+  name.push_str(".json");
+  let current = read_session(join(claude_dir("sessions").as_str(), name.as_str()).as_str()) else {
+    return none;
+  };
+  if (!current.proc_start.eq(s.proc_start)) {
+    return none;
+  }
+  return current;
+}
+
+// Asks the terminal's Claude Code to quit, and makes it after ten seconds.
+pub fn end_session(s&: TerminalSession): () {
+  if (!alive(s.pid, s.proc_start.as_str())) {
+    return;
+  }
+  let _ = send_signal(s.pid, kSignalTerminate);
+  let start = now();
+  while (start.elapsed() < seconds(10)) {
+    if (!alive(s.pid, s.proc_start.as_str())) {
+      return;
+    }
+    sleep(milliseconds(100));
+  }
+  let _ = send_signal(s.pid, kSignalKill);
+  sleep(milliseconds(200));
+}
+
+// The transcript's directory is named after the session's, so the session
+// id, which is unique, finds it.
+pub fn transcript_path(session: str): String? {
+  let projects = claude_dir("projects");
+  var file = from_str(session);
+  file.push_str(".jsonl");
+  for (let dir& in list_directory(projects.as_str()) ?? new::<String>()) {
+    let p = join(join(projects.as_str(), dir.as_str()).as_str(), file.as_str());
+    if (path_exists(p.as_str())) {
+      return p;
+    }
+  }
+  return none;
+}
+
+pub fn sessions_message(list&: Vector<TerminalSession>): Json {
+  var all = array();
+  for (let s& in list) {
+    var o = object();
+    set(o, "id", text(s.id.as_str()));
+    set(o, "pid", number(s.pid as f64));
+    set(o, "project", text(s.project.as_str()));
+    set(o, "name", text(s.name.as_str()));
+    set(o, "state", text(s.busy ? "working" : "idle"));
+    set(o, "started", number(s.started));
+    push(all, o);
+  }
+  var m = object();
+  set(m, "type", text("sessions"));
+  set(m, "sessions", all);
+  return m;
+}

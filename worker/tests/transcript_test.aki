@@ -9,7 +9,7 @@ import {Json, parse, to_string} from akibase::text::json;
 import {lines} from akibase::strings::string_util;
 import {eprintln} from akibase::logging;
 import {Transcript} from worker::transcript;
-import {read_claude} from worker::claude_code;
+import {read_claude, read_terminal} from worker::claude_code;
 import {read_codex} from worker::codex;
 
 comptime let kClaude: str = r"""
@@ -31,6 +31,19 @@ comptime let kCodex: str = r"""
 {"type":"turn.completed","usage":{"input_tokens":33352}}
 """;
 
+// A terminal session's transcript: a typed prompt, injected context, a
+// subagent's line, a tool call and its result, and the answer.
+comptime let kTerminal: str = r"""
+{"type":"user","isMeta":null,"origin":{"kind":"human"},"uuid":"u1","message":{"role":"user","content":"count the files"},"sessionId":"bcef"}
+{"type":"user","isMeta":true,"uuid":"u2","message":{"role":"user","content":[{"type":"text","text":"[Image: original 1272x2772]"}]}}
+{"type":"assistant","isSidechain":true,"uuid":"a0","message":{"content":[{"type":"text","text":"subagent says"}]}}
+{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","id":"toolu_07","name":"Bash","input":{"command":"ls | wc -l"}}]}}
+{"type":"user","uuid":"u3","message":{"role":"user","content":[{"tool_use_id":"toolu_07","type":"tool_result","content":"33","is_error":false}]}}
+{"type":"assistant","uuid":"a2","message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"33 files."}]}}
+{"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"only .kt","origin":{"kind":"human"}}}
+{"type":"ai-title","aiTitle":"Count files","sessionId":"bcef"}
+""";
+
 fn check(ok: bool, what: str, var failures&: i32): () {
   if (!ok) {
     eprintln(what);
@@ -39,13 +52,13 @@ fn check(ok: bool, what: str, var failures&: i32): () {
 }
 
 // Every entry the lines give, as JSON text without the timestamps.
-fn run(text: str, claude: bool, var t&: Transcript): Vector<String> {
+fn run(text: str, agent: str, var t&: Transcript): Vector<String> {
   var out = new::<String>();
   for (let line in lines(text)) {
     let j = parse(line) else {
       continue;
     };
-    let entries = claude ? read_claude(t, j) : read_codex(t, j);
+    let entries = agent == "claude" ? read_claude(t, j) : agent == "codex" ? read_codex(t, j) : read_terminal(t, j);
     for (let e& in entries) {
       out.push(to_string(without_at(e)));
     }
@@ -75,7 +88,7 @@ pub fn main(): i32 {
   var failures: i32 = 0;
 
   var c = Transcript("t1", "");
-  let ce = run(kClaude, true, c);
+  let ce = run(kClaude, "claude", c);
   check(c.session.as_str() == "2896", "claude session", failures);
   check(ce.len() == 4, "claude entry count", failures);
   check(ce[0].as_str() == "{\"id\":\"t1.toolu_01\",\"kind\":\"tool\",\"tool\":\"Bash\",\"detail\":\"ls\",\"state\":\"running\"}",
@@ -87,12 +100,22 @@ pub fn main(): i32 {
   check(!c.failed, "claude succeeded", failures);
 
   var x = Transcript("t2", "");
-  let xe = run(kCodex, false, x);
+  let xe = run(kCodex, "codex", x);
   check(x.session.as_str() == "01a0", "codex session", failures);
   check(xe.len() == 4, "codex entry count", failures);
   check(xe[1].as_str() == "{\"id\":\"t2.item_1\",\"kind\":\"tool\",\"tool\":\"shell\",\"detail\":\"ls\",\"state\":\"running\"}",
         "codex command start", failures);
   check(xe[2].as_str() == "{\"id\":\"t2.item_1\",\"state\":\"ok\",\"output\":\"a.txt\\n\"}", "codex command end", failures);
   check(xe[3].as_str() == "{\"id\":\"t2.item_2\",\"kind\":\"agent\",\"text\":\"Done\"}", "codex text", failures);
+
+  var w = Transcript("w", "bcef");
+  let we = run(kTerminal, "terminal", w);
+  check(we.len() == 5, "terminal entry count", failures);
+  check(we[4].as_str() == "{\"id\":\"w.q1\",\"kind\":\"user\",\"text\":\"only .kt\"}", "terminal message typed while busy", failures);
+  check(we[0].as_str() == "{\"id\":\"w.u1\",\"kind\":\"user\",\"text\":\"count the files\"}", "terminal prompt", failures);
+  check(we[1].as_str() == "{\"id\":\"w.toolu_07\",\"kind\":\"tool\",\"tool\":\"Bash\",\"detail\":\"ls | wc -l\",\"state\":\"running\"}",
+        "terminal tool start", failures);
+  check(we[2].as_str() == "{\"id\":\"w.toolu_07\",\"state\":\"ok\",\"output\":\"33\"}", "terminal tool result", failures);
+  check(we[3].as_str() == "{\"id\":\"w.a2.1\",\"kind\":\"agent\",\"text\":\"33 files.\"}", "terminal answer", failures);
   return failures;
 }

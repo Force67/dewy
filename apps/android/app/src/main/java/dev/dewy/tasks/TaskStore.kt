@@ -85,6 +85,12 @@ class TaskStore(connection: Flow<Connection?>, private val scope: CoroutineScope
         return task
     }
 
+    suspend fun attachSession(box: String, session: String): Task {
+        val task = requireClient().attachSession(box, session)
+        upsert(task)
+        return task
+    }
+
     suspend fun steer(id: String, text: String) = requireClient().steer(id, text)
 
     suspend fun stop(id: String) = requireClient().stop(id)

@@ -70,7 +70,20 @@ data class Box(
     val agents: List<String> = emptyList(),
     val projects: List<Project> = emptyList(),
     val stats: BoxStats = BoxStats(),
+    val sessions: List<TerminalSession> = emptyList(),
 )
+
+/** A Claude Code session running in a terminal on a box, which a task can follow. */
+@Serializable
+data class TerminalSession(
+    val id: String,
+    val project: String = "",
+    val name: String = "",
+    val state: TaskState = TaskState.Idle,
+    val started: Long = 0,
+) {
+    val projectName get() = project.trimEnd('/').substringAfterLast('/')
+}
 
 @Serializable
 data class BoardState(val seq: Long, val boxes: List<Box>, val tasks: List<Task>)

@@ -119,6 +119,9 @@ fun Shell(
             composing = true
         },
         archive = { task, archived -> scope.launch { runCatching { store.archive(task.id, archived) } } },
+        attach = { box, session ->
+            scope.launch { runCatching { store.attachSession(box, session) }.onSuccess { openDetail(Route.Thread(it.id)) } }
+        },
     )
 
     BoxWithConstraints(Modifier.fillMaxSize().background(LocalPalette.current.ground)) {
@@ -155,6 +158,7 @@ private class Screens(
     val openDetail: (Route) -> Unit,
     val compose: (Draft) -> Unit,
     val archive: (Task, Boolean) -> Unit,
+    val attach: (box: String, session: String) -> Unit,
 ) {
     val board: Board get() = boardState.value
     val seen: Map<String, Long> get() = seenState.value
@@ -216,6 +220,7 @@ private class Screens(
                 onBack = onBack,
                 onOpenTask = { openDetail(Route.Thread(it.id)) },
                 onStartIn = { box, project -> compose(Draft(box, project)) },
+                onAttach = attach,
             )
             Route.Settings -> SettingsScreen(settings, board, onBack)
         }

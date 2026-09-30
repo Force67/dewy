@@ -22,6 +22,7 @@ import {Transcript} from worker::transcript;
 import {make_fifo} from worker::fifo;
 import {claude_command, read_claude} from worker::claude_code;
 import {codex_command, read_codex} from worker::codex;
+import {find_session, end_session} from worker::terminal;
 
 pub enum Agent { Claude, Codex }
 
@@ -100,6 +101,15 @@ pub fn run_turn(job: TurnJob): () {
   err_path.push_str(".err");
 
   var t = Transcript(o.turn.as_str(), o.session.as_str());
+  post(job.outbox, state_message(task, "working"));
+  // Two writers on one session diverge, so a terminal still running it
+  // ends first.
+  if (o.agent == Agent::Claude && !o.session.is_empty()) {
+    if (let s = find_session(o.session.as_str())) {
+      end_session(s);
+      post(job.outbox, entry_message(task, said(t.next_id().as_str(), "note", "Took over from the terminal.")));
+    }
+  }
   var ok = run_agent(job, out_path.as_str(), err_path.as_str(), t);
   if (t.failed) {
     ok = false;

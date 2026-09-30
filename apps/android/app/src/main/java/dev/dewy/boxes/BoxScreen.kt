@@ -18,6 +18,7 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBackIos
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -53,6 +54,7 @@ fun BoxScreen(
     onBack: (() -> Unit)?,
     onOpenTask: (Task) -> Unit,
     onStartIn: (box: String, project: String) -> Unit,
+    onAttach: (box: String, session: String) -> Unit,
 ) {
     val p = LocalPalette.current
     Scaffold(
@@ -124,6 +126,25 @@ fun BoxScreen(
                             if (i > 0) Hairline(52.dp)
                             GroupRow(t.title, subtitle = t.projectName, onClick = { onOpenTask(t) }) {
                                 StateDot(t.state, Modifier.padding(end = 6.dp))
+                            }
+                        }
+                    }
+                }
+            }
+            if (box.sessions.isNotEmpty()) {
+                item {
+                    Group("Terminal sessions") {
+                        box.sessions.forEachIndexed { i, s ->
+                            if (i > 0) Hairline(52.dp)
+                            val followed = tasks.find { it.box == box.name && it.session == s.id }
+                            GroupRow(
+                                s.name.ifBlank { s.projectName },
+                                icon = Icons.Rounded.Terminal,
+                                iconTint = p.inkSoft,
+                                subtitle = if (followed != null) "${s.projectName} · following" else s.projectName,
+                                onClick = { onAttach(box.name, s.id) },
+                            ) {
+                                StateDot(s.state, Modifier.padding(end = 6.dp))
                             }
                         }
                     }

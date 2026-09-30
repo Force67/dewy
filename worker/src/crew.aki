@@ -16,12 +16,16 @@ import {replace} from akibase::algorithm;
 import {str_of, string_of} from wire::fields;
 import {said, entry_message} from worker::entry;
 import {Ended, Outbox, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
+import {find_session} from worker::terminal;
+import {WatchJob, watch_session} from worker::watch;
 
 struct Running {
   pub var task: String
   pub var pid: SharedPointer<Atomic<i32>>
   pub var stopped: SharedPointer<Atomic<i32>>
   pub var thread: Thread<()>
+  // Following a session in a terminal rather than running a turn.
+  pub var watch: bool
 }
 
 struct Session {
@@ -42,6 +46,7 @@ pub struct Crew {
   pub fn put_back(var self&, lines: Vector<String>): ();
   pub fn running_tasks(self&): Json;
   fn start(var self&, o: TurnOrder): ();
+  fn watch(var self&, task: str, session: str): ();
   fn stop(var self&, task: str): ();
   fn is_running(self&, task: str): bool;
   fn session_of(self&, task: str): String;
@@ -61,6 +66,10 @@ fn Crew::order(var self&, msg&: Json): () {
     self.stop(task);
     return;
   }
+  if (kind == "watch") {
+    self.watch(task, str_of(msg, "session") ?? "");
+    return;
+  }
   if (kind != "turn") {
     return;
   }
@@ -76,6 +85,12 @@ fn Crew::order(var self&, msg&: Json): () {
   };
   if (self.is_running(task)) {
     self.waiting.push(o);
+    // The session is still in its terminal: take it over.
+    for (let r& in self.running) {
+      if (r.watch && r.task.as_str() == task) {
+        r.stopped.get().store(1);
+      }
+    }
   } else {
     self.start(o);
   }
@@ -91,7 +106,22 @@ fn Crew::start(var self&, o: TurnOrder): () {
   let stopped = make_shared(Atomic::<i32>(0));
   let job = TurnJob { order, yolo: self.yolo, outbox: self.outbox.share(), pid: pid.share(), stopped: stopped.share() };
   let thread = spawn(run_turn, job);
-  self.running.push(Running { task, pid, stopped, thread });
+  self.running.push(Running { task, pid, stopped, thread, watch: false });
+}
+
+fn Crew::watch(var self&, task: str, session: str): () {
+  if (self.is_running(task)) {
+    return;
+  }
+  let s = find_session(session) else {
+    post(self.outbox, entry_message(task, said("w.gone", "error", "This session is no longer running in a terminal.")));
+    post(self.outbox, state_message(task, "idle"));
+    return;
+  };
+  let stopped = make_shared(Atomic::<i32>(0));
+  let job = WatchJob { task: from_str(task), session: s, outbox: self.outbox.share(), stopped: stopped.share() };
+  let thread = spawn(watch_session, job);
+  self.running.push(Running { task: from_str(task), pid: make_shared(Atomic::<i32>(0)), stopped, thread, watch: true });
 }
 
 fn Crew::stop(var self&, task: str): () {

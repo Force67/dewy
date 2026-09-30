@@ -52,6 +52,16 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
         }
     }
 
+    suspend fun attachSession(box: String, session: String): Task {
+        val body = buildJsonObject {
+            put("box", box)
+            put("session", session)
+        }
+        return call(request("api/sessions/attach").post(body.toString().toRequestBody(jsonType)).build()) {
+            wireJson.decodeFromString(it)
+        }
+    }
+
     suspend fun steer(id: String, text: String) =
         post("api/tasks/$id/messages", buildJsonObject { put("text", text) }.toString())
 

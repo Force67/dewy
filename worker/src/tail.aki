@@ -1,0 +1,82 @@
+// A file another process appends to, read line by line as it grows.
+// akibase's File reads through stdio, whose end of file sticks, so this
+// reads the descriptor: past the end, read(2) returns 0 until more is
+// written.
+
+module worker::tail;
+
+import {String, with_nul} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {utf8_lossy} from akibase::text::code_convert;
+
+extern("open") fn c_open(path: *const c8, flags: i32): i32;
+extern("read") fn c_read(fd: i32, p: *var u8, n: usize): i64;
+extern("close") fn c_close(fd: i32): i32;
+
+comptime let kReadOnly: i32 = 0;
+
+pub struct Tail : Drop, Send {
+  var fd: i32
+  var buf: Vector<u8>
+  var head: usize
+
+  fn Tail(fd: i32): Tail;
+  pub fn next_line(var self&): String?;
+  pub fn drop(var self&): ();
+}
+
+pub fn open_tail(path: str): Tail? {
+  let c = with_nul(path);
+  var fd: i32 = -1;
+  unsafe {
+    fd = c_open(@ptr(c.as_str()), kReadOnly);
+  }
+  if (fd < 0) {
+    return none;
+  }
+  return Tail(fd);
+}
+
+fn Tail::Tail(fd: i32): Tail => Tail { fd, buf: new::<u8>(), head: 0 };
+
+// The next whole line without its newline, or none until more is written.
+// A line still being written stays buffered.
+fn Tail::next_line(var self&): String? {
+  while (true) {
+    for (let i in self.head..#self.buf) {
+      if (self.buf[i] == 10) {
+        let line = utf8_lossy(self.buf.as_slice()[self.head..i]);
+        self.head = i + 1;
+        return line;
+      }
+    }
+    if (self.head > 0) {
+      var rest = new::<u8>();
+      for (let i in self.head..#self.buf) {
+        rest.push(self.buf[i]);
+      }
+      self.buf = rest;
+      self.head = 0;
+    }
+    var chunk = [0u8; 65536];
+    var n: i64 = 0;
+    unsafe {
+      n = c_read(self.fd, @ptr(chunk), 65536);
+    }
+    if (n <= 0) {
+      return none;
+    }
+    for (let i in 0usize..n as usize) {
+      self.buf.push(chunk[i]);
+    }
+  }
+  return none;
+}
+
+fn Tail::drop(var self&): () {
+  if (self.fd >= 0) {
+    unsafe {
+      let _ = c_close(self.fd);
+    }
+  }
+}

@@ -41,12 +41,13 @@ pub fn state_named(name: str): TaskState? => match (name) {
 };
 
 // Why the board turned a request down.
-pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, Empty, UnknownAgent }
+pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, NoSuchSession, Empty, UnknownAgent }
 
 pub fn refusal_message(r: Refusal): str<'static> => match (r) {
   Refusal::NoSuchBox => "no such box",
   Refusal::BoxOffline => "the box is offline",
   Refusal::NoSuchTask => "no such task",
+  Refusal::NoSuchSession => "the box lists no such session",
   Refusal::Empty => "the message is empty",
   Refusal::UnknownAgent => "the box has no such agent",
 };
@@ -79,6 +80,9 @@ pub struct Box : Send {
   pub var agents: String
   pub var projects: String
   pub var stats: String
+  // JSON text: the Claude Code sessions running in terminals on the box, as
+  // the worker last listed them.
+  pub var sessions: String
   pub var online: bool
   pub var last_seen: i64
   // Lines for the box's worker, oldest first.
@@ -102,6 +106,7 @@ pub struct Board : Send {
   pub fn Board(): Board;
   pub fn last_seq(self&): u64;
   pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, now: i64): String ! Refusal;
+  pub fn attach_session(var self&, box_name: str, session: str, now: i64): String ! Refusal;
   pub fn steer(var self&, id: str, prompt: str, now: i64): () ! Refusal;
   pub fn stop(var self&, id: str, now: i64): () ! Refusal;
   pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
@@ -200,6 +205,60 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
   return id;
 }
 
+// Follows a Claude Code session the box lists as running in a terminal.
+// The task starts with the session and no turns of its own; the worker
+// mirrors the session into it. Attaching again returns the same task and
+// asks again, for a worker that lost its watch; one still watching
+// ignores it.
+fn Board::attach_session(var self&, box_name: str, session: str, now: i64): String ! Refusal {
+  let b = self.find_box(box_name) else {
+    return fail Refusal::NoSuchBox;
+  };
+  if (!self.boxes[b].online) {
+    return fail Refusal::BoxOffline;
+  }
+  var watch = object();
+  set(watch, "type", text("watch"));
+  set(watch, "session", text(session));
+  for (let t& in self.tasks) {
+    if (#session > 0 && t.session.as_str() == session && t.box_name.as_str() == box_name) {
+      set(watch, "task", text(t.id.as_str()));
+      self.boxes[b].outbox.push(to_string(watch));
+      return t.id.clone();
+    }
+  }
+  let listed = parse(self.boxes[b].sessions.as_str()) ?? array();
+  var found: Json? = none;
+  if (let all = as_array(listed)) {
+    for (let s& in all) {
+      if ((str_of(s, "id") ?? "") == session) {
+        found = copy(s);
+      }
+    }
+  }
+  let s = found else {
+    return fail Refusal::NoSuchSession;
+  };
+  var id = String();
+  id.push_u64(self.next_id);
+  self.next_id += 1;
+  let working = (str_of(s, "state") ?? "") == "working";
+  var title = from_str(str_of(s, "name") ?? "");
+  if (title.is_empty()) {
+    title = from_str("Terminal session");
+  }
+  self.tasks.push(Task {
+    id: id.clone(), box_name: from_str(box_name), project: string_of(s, "project"), agent: from_str("claude"),
+    title, session: from_str(session), preview: String(), activity: String(),
+    state: working ? TaskState::Working : TaskState::Idle, archived: false, created: now, updated: now, turns: 0,
+    entries: new::<String>(), entry_ids: new::<String>()
+  });
+  self.touch_task(self.tasks.len() - 1);
+  set(watch, "task", text(id.as_str()));
+  self.boxes[b].outbox.push(to_string(watch));
+  return id;
+}
+
 fn Board::steer(var self&, id: str, prompt: str, now: i64): () ! Refusal {
   let i = self.find_task(id) else {
     return fail Refusal::NoSuchTask;
@@ -280,13 +339,14 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   if (b == self.boxes.len()) {
     self.boxes.push(Box {
       name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
-      stats: from_str("{}"), online: false, last_seen: now, outbox: new::<String>()
+      stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
     });
   }
   self.boxes[b].host = string_of(hello, "host");
   self.boxes[b].os = string_of(hello, "os");
   self.boxes[b].agents = to_string(get(hello, "agents") ?? Json::Null);
   self.boxes[b].projects = to_string(get(hello, "projects") ?? Json::Null);
+  self.boxes[b].sessions = from_str("[]");
   self.boxes[b].online = true;
   self.boxes[b].last_seen = now;
   self.touch_box(b);
@@ -312,6 +372,7 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
 fn Board::detach(var self&, name: str, now: i64): () {
   if (let b = self.find_box(name)) {
     self.boxes[b].online = false;
+    self.boxes[b].sessions = from_str("[]");
     self.boxes[b].last_seen = now;
     self.touch_box(b);
   }
@@ -325,6 +386,13 @@ fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
     if (let b = self.find_box(box_name)) {
       self.boxes[b].stats = to_string(get(msg, "stats") ?? Json::Null);
       self.boxes[b].last_seen = now;
+      self.touch_box(b);
+    }
+    return;
+  }
+  if (kind == "sessions") {
+    if (let b = self.find_box(box_name)) {
+      self.boxes[b].sessions = to_string(get(msg, "sessions") ?? Json::Null);
       self.touch_box(b);
     }
     return;
@@ -344,6 +412,9 @@ fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
     }
   } else if (kind == "session") {
     self.tasks[i].session = string_of(msg, "session");
+    self.touch_task(i);
+  } else if (kind == "title") {
+    self.tasks[i].title = from_str(first_line(str_of(msg, "title") ?? "", 120));
     self.touch_task(i);
   } else if (kind == "state") {
     let state = state_named(str_of(msg, "state") ?? "") else {
@@ -514,6 +585,7 @@ fn box_json(b&: Box): Json {
   set(o, "agents", parse(b.agents.as_str()) ?? array());
   set(o, "projects", parse(b.projects.as_str()) ?? array());
   set(o, "stats", parse(b.stats.as_str()) ?? object());
+  set(o, "sessions", parse(b.sessions.as_str()) ?? array());
   return o;
 }
 
@@ -582,7 +654,8 @@ fn Board::restore_box(var self&, j&: Json): () {
   self.boxes.push(Box {
     name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
     agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
-    stats: from_str("{}"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64, outbox: new::<String>()
+    stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
+    outbox: new::<String>()
   });
 }
 

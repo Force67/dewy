@@ -20,6 +20,8 @@ import {eprintln, print} from akibase::logging;
 import {LineStream} from wire::line_stream;
 import {Crew} from worker::crew;
 import {hello, hostname, stats} from worker::inventory;
+import {terminal_sessions, sessions_message} from worker::terminal;
+import {to_string} from akibase::text::json;
 import {resolve_ipv4} from worker::resolve;
 
 fn parser(): OptionParser {
@@ -110,6 +112,9 @@ fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [Stri
   }
   var last_stats = now();
   let _ = l.send(stats());
+  var sessions = String();
+  var last_scan = now();
+  var scanned = false;
   while (true) {
     let got = l.read() else {
       return;
@@ -125,6 +130,18 @@ fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [Stri
         lines.insert(0, line);
         crew.put_back(lines);
         return;
+      }
+    }
+    if (!scanned || last_scan.elapsed() > seconds(5)) {
+      scanned = true;
+      last_scan = now();
+      let list = to_string(sessions_message(terminal_sessions()));
+      if (!list.eq(sessions)) {
+        if (let _ = l.send_text(list.as_str())) {
+          sessions = list;
+        } else {
+          return;
+        }
       }
     }
     if (last_stats.elapsed() > seconds(15)) {

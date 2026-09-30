@@ -82,6 +82,70 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
   return out;
 }
 
+// A line of the transcript Claude Code writes for a session it runs in a
+// terminal. Its messages carry the same blocks as stream-json. What the
+// person typed has origin "human"; injected context (isMeta) and subagent
+// traffic (isSidechain) stay out. Ids come from the transcript, so reading
+// a line twice updates the same entries.
+pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
+  var out = new::<Json>();
+  if ((bool_of(line, "isSidechain") ?? false) || (bool_of(line, "isMeta") ?? false)) {
+    return out;
+  }
+  let kind = str_of(line, "type") ?? "";
+  let uuid = str_of(line, "uuid") ?? "";
+  var human = false;
+  if (let origin = path(line, "origin.kind")) {
+    human = (as_str(origin) ?? "") == "human";
+  }
+  // A message typed while the session was busy.
+  if (kind == "attachment" && (str_of(path(line, "attachment") ?? Json::Null, "type") ?? "") == "queued_command") {
+    if (let a = path(line, "attachment")) {
+      let prompt = result_text(get(a, "prompt") ?? Json::Null);
+      if ((as_str(path(a, "origin.kind") ?? Json::Null) ?? "") == "human" && prompt.len() > 0) {
+        out.push(said(t.id_for(uuid).as_str(), "user", prompt.as_str()));
+      }
+    }
+    return out;
+  }
+  if (kind == "user" && human) {
+    if (let content = path(line, "message.content")) {
+      if (let s = as_str(content)) {
+        out.push(said(t.id_for(uuid).as_str(), "user", s));
+        return out;
+      }
+    }
+  }
+  let blocks = as_array(path(line, "message.content") ?? Json::Null) else {
+    return out;
+  };
+  var i: u64 = 0;
+  for (let b& in blocks) {
+    let block = str_of(b, "type") ?? "";
+    var local = from_str(uuid);
+    local.push_c8('.');
+    local.push_u64(i);
+    i += 1;
+    if (block == "text") {
+      let body = str_of(b, "text") ?? "";
+      if (kind == "assistant" && #body > 0) {
+        out.push(said(t.id_for(local.as_str()).as_str(), "agent", body));
+      } else if (kind == "user" && human && #body > 0) {
+        out.push(said(t.id_for(local.as_str()).as_str(), "user", body));
+      }
+    } else if (block == "tool_use" && kind == "assistant") {
+      let id = t.id_for(str_of(b, "id") ?? "");
+      let name = str_of(b, "name") ?? "tool";
+      out.push(tool_started(id.as_str(), name, summary(get(b, "input") ?? Json::Null).as_str()));
+    } else if (block == "tool_result" && kind == "user") {
+      let id = t.id_for(str_of(b, "tool_use_id") ?? "");
+      let ok = !(bool_of(b, "is_error") ?? false);
+      out.push(tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str()));
+    }
+  }
+  return out;
+}
+
 // The one input field that says what a tool call does.
 fn summary(input&: Json): String {
   let keys = ["command", "file_path", "pattern", "url", "query", "description", "prompt", "path"];
