@@ -193,6 +193,13 @@ class TaskStore(connection: Flow<Connection?>, private val cache: DewyCache, pri
         _board.update { b -> b.copy(tasks = b.tasks.map { if (it.id == id) it.copy(model = model) else it }) }
     }
 
+    suspend fun armPowerOff(box: String, armed: Boolean) {
+        requireClient().armPowerOff(box, armed)
+        _board.update { b ->
+            b.copy(boxes = b.boxes.map { if (it.name == box) it.copy(poweroff = it.poweroff.copy(armed = armed, at = 0)) else it })
+        }
+    }
+
     suspend fun archive(id: String, archived: Boolean) {
         _board.update { b -> b.copy(tasks = b.tasks.map { if (it.id == id) it.copy(archived = archived) else it }) }
         requireClient().archive(id, archived)

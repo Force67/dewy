@@ -1,0 +1,44 @@
+// Short commands the worker runs for what they print, with their output in
+// a file of its own private directory.
+
+module worker::command;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Command, exit_code} from akibase::process::child;
+import {read_file, delete_file} from akibase::filesystem::file_util;
+import {join} from akibase::filesystem::path;
+import {seconds, system_now} from akibase::time::time;
+import {private_temp} from worker::turn;
+
+pub fn temp_path(name: str): String {
+  var stem = from_str("dewy-");
+  stem.push_str(name);
+  stem.push_c8('-');
+  stem.push_i64(system_now().unix_nanoseconds());
+  return join(private_temp().as_str(), stem.as_str());
+}
+
+// Runs `c` with its output in a file; its text, or none when it failed or
+// hung.
+pub fn output_of(var c&: Command, name: str): String? {
+  let out = temp_path(name);
+  c.stdin_from("/dev/null");
+  c.stdout_to(out.as_str());
+  c.stderr_to("/dev/null");
+  var child = c.spawn() else (let e) {
+    return none;
+  };
+  var text: String? = none;
+  if (let status = child.wait_timeout(seconds(30))) {
+    if (exit_code(status) == 0) {
+      if (let t = read_file(out.as_str())) {
+        text = t;
+      }
+    }
+  } else {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  let _ = delete_file(out.as_str());
+  return text;
+}

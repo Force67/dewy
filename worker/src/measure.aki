@@ -7,7 +7,7 @@ module worker::measure;
 
 import {String, from_str, with_nul, str_as_bytes} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
-import {Command, exit_code} from akibase::process::child;
+import {Command} from akibase::process::child;
 import {Json, array, push, parse, get, as_array, to_string} from akibase::text::json;
 import {SharedPointer} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
@@ -17,9 +17,10 @@ import {get_environment_variable} from akibase::environment_variables;
 import {utf8_lossy} from akibase::text::code_convert;
 import {lines} from akibase::strings::string_util;
 import {contains} from akibase::strings::string_search;
-import {seconds, sleep, system_now, unix_time_milliseconds} from akibase::time::time;
+import {seconds, sleep, unix_time_milliseconds} from akibase::time::time;
 import {str_of, num_of} from wire::fields;
-import {Outbox, private_temp} from worker::turn;
+import {Outbox} from worker::turn;
+import {temp_path, output_of} from worker::command;
 import {on_path} from worker::inventory;
 import {newest_rollouts} from worker::codex;
 import {last_bytes} from worker::tail;
@@ -153,39 +154,6 @@ fn last_rate_limits(file: str): Meter? {
     }
   }
   return found;
-}
-
-fn temp_path(name: str): String {
-  var stem = from_str("dewy-");
-  stem.push_str(name);
-  stem.push_c8('-');
-  stem.push_i64(system_now().unix_nanoseconds());
-  return join(private_temp().as_str(), stem.as_str());
-}
-
-// Runs `c` with its output in a file; its text, or none when it failed or
-// hung.
-fn output_of(var c&: Command, name: str): String? {
-  let out = temp_path(name);
-  c.stdin_from("/dev/null");
-  c.stdout_to(out.as_str());
-  c.stderr_to("/dev/null");
-  var child = c.spawn() else (let e) {
-    return none;
-  };
-  var text: String? = none;
-  if (let status = child.wait_timeout(seconds(30))) {
-    if (exit_code(status) == 0) {
-      if (let t = read_file(out.as_str())) {
-        text = t;
-      }
-    }
-  } else {
-    let _ = child.kill();
-    let _ = child.wait();
-  }
-  let _ = delete_file(out.as_str());
-  return text;
 }
 
 fn spend_query(now: i64): String {

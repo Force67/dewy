@@ -13,6 +13,14 @@ fn claude_usage(five: str, seven: str): String =>
 fn claude_usage_at(five: str, seven: str, at: i32): String =>
   f"{{\"type\":\"usage\",\"meters\":[{{\"agent\":\"claude\",\"provider\":\"anthropic\",\"at\":{at},\"limits\":[{{\"name\":\"5 hours\",\"used\":{five}}},{{\"name\":\"7 days\",\"used\":{seven}}}]}}]}}";
 
+fn take_all(var b&: Board, box_name: str): String {
+  var all = String();
+  for (let line& in b.take_outbox(box_name)) {
+    all.push_str(line.as_str());
+  }
+  return all;
+}
+
 fn check(ok: bool, what: str, var failures&: i32): () {
   if (!ok) {
     eprintln(what);
@@ -205,6 +213,68 @@ pub fn main(): i32 {
   var saved = Board();
   saved.restore_task(b.task_json(big.as_str())!);
   check(contains(to_string(saved.task_json(big.as_str())!).as_str(), "\"tokens\":320,\"cost\":0.5"), "spend is saved", failures);
+
+  // Power off: armed, a box turns off a minute after it is no longer busy.
+  let _ = b.attach(parse("{\"type\":\"hello\",\"box\":\"head\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[],\"poweroff\":false}")!, 895000);
+  if (let _ = b.arm_power_off("head", true)) {
+    check(false, "a box that cannot turn off is not armed", failures);
+  } else (let e) {
+    check(e == Refusal::CannotPowerOff, "cannot power off", failures);
+  }
+  let _ = b.attach(parse("{\"type\":\"hello\",\"box\":\"pc\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[],\"poweroff\":true}")!, 895000);
+  let job = b.create_task("pc", "/src/dewy", "claude", "", "long job", none_images, false, 895001)!;
+  b.arm_power_off("pc", true)!;
+  b.sweep(895002);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"poweroff\":{\"can\":true,\"armed\":true,\"at\":0,"), "armed, busy", failures);
+  let _ = b.apply("pc", parse(f"{{\"type\":\"state\",\"task\":\"{job}\",\"state\":\"idle\"}}".as_str())!, 895003);
+  b.sweep(895004);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"armed\":true,\"at\":955004"), "idle: the countdown starts", failures);
+  let _ = b.apply("pc", parse("{\"type\":\"sessions\",\"sessions\":[{\"id\":\"s1\",\"state\":\"working\"}]}")!, 895005);
+  b.sweep(895006);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"armed\":true,\"at\":0"), "a working terminal session stops it", failures);
+  let _ = b.apply("pc", parse("{\"type\":\"sessions\",\"sessions\":[{\"id\":\"s1\",\"state\":\"idle\"}]}")!, 895007);
+  b.sweep(895008);
+  b.sweep(955007);
+  check(!contains(take_all(b, "pc").as_str(), "poweroff"), "not before the minute is up", failures);
+  var kept = Board();
+  let boxes_now = parse(to_string(b.boxes_json()).as_str())!;
+  for (let one& in as_array(boxes_now)!) {
+    if ((str_of(one, "name") ?? "") == "pc") {
+      kept.restore_box(one);
+    }
+  }
+  check(contains(to_string(kept.boxes_json()).as_str(), "\"can\":true,\"armed\":true"), "arming is saved", failures);
+  b.sweep(955008);
+  check(contains(take_all(b, "pc").as_str(), "{\"type\":\"poweroff\"}"), "then it turns off", failures);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"armed\":false,\"at\":0"), "and is disarmed for when it is back", failures);
+
+  // A task started, or the switch turned off, during the countdown keeps
+  // the box on.
+  b.arm_power_off("pc", true)!;
+  b.sweep(960000);
+  let again = b.create_task("pc", "/src/dewy", "claude", "", "one more", none_images, false, 960001)!;
+  b.sweep(960002);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"armed\":true,\"at\":0"), "a new task stops the countdown", failures);
+  let _ = b.apply("pc", parse(f"{{\"type\":\"state\",\"task\":\"{again}\",\"state\":\"idle\"}}".as_str())!, 960003);
+  b.sweep(960004);
+  b.arm_power_off("pc", false)!;
+  b.sweep(1100000);
+  check(!contains(take_all(b, "pc").as_str(), "poweroff"), "disarming stops it", failures);
+
+  // An order the worker never got is dropped when it goes away.
+  b.arm_power_off("pc", true)!;
+  b.sweep(1100001);
+  b.sweep(1200000);
+  b.detach("pc", 1200001);
+  let _ = b.attach(parse("{\"type\":\"hello\",\"box\":\"pc\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[],\"poweroff\":true}")!, 1200002);
+  check(!contains(take_all(b, "pc").as_str(), "poweroff"), "no late power-off after a reconnect", failures);
+
+  // A worker that may no longer turn the box off disarms it.
+  b.arm_power_off("pc", true)!;
+  let _ = b.attach(parse("{\"type\":\"hello\",\"box\":\"pc\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[],\"poweroff\":false}")!, 1200003);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"can\":false,\"armed\":false"), "no longer allowed, no longer armed", failures);
+  let _ = b.apply("pc", parse("{\"type\":\"poweroff\",\"error\":\"systemctl poweroff failed on the box.\"}")!, 1200004);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"error\":\"systemctl poweroff failed on the box.\""), "a failure shows", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

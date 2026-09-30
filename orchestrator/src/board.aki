@@ -13,9 +13,11 @@ import {Heap} from akibase::allocator::default_crt_alloc;
 import {Json, object, array, text, number, boolean, set, push, get, as_array, as_str, parse, to_string} from akibase::text::json;
 import {str_of, string_of, num_of, bool_of, merge, copy} from wire::fields;
 import {first_line} from wire::clip;
-import {trim} from akibase::strings::string_search;
+import {trim, contains} from akibase::strings::string_search;
 import {replace} from akibase::algorithm;
 
+// An armed box turns off this long after its last task ended.
+pub comptime let kPowerOffMillis: i64 = 60000;
 // A task that says nothing for this long while working is stalled.
 pub comptime let kStallMillis: i64 = 180000;
 comptime let kFeedLength: usize = 4000;
@@ -41,7 +43,7 @@ pub fn state_named(name: str): TaskState? => match (name) {
 };
 
 // Why the board turned a request down.
-pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, NoSuchSession, Empty, UnknownAgent, UnknownModel }
+pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, NoSuchSession, Empty, UnknownAgent, UnknownModel, CannotPowerOff }
 
 pub fn refusal_message(r: Refusal): str<'static> => match (r) {
   Refusal::NoSuchBox => "no such box",
@@ -51,6 +53,7 @@ pub fn refusal_message(r: Refusal): str<'static> => match (r) {
   Refusal::Empty => "the message is empty",
   Refusal::UnknownAgent => "the box has no such agent",
   Refusal::UnknownModel => "the box has no such model",
+  Refusal::CannotPowerOff => "the box cannot turn itself off",
 };
 
 pub struct Task : Send {
@@ -106,6 +109,13 @@ pub struct Box : Send {
   // Providers with a meter since the worker's hello. The first one after
   // it is only a baseline: the rise since the one before happened unseen.
   pub var measured: Vector<String>
+  // Its user may turn it off; armed, it turns off when its tasks are done,
+  // at `off_at` once they are (see docs/adr/0007-power-off-when-done.md).
+  pub var can_power_off: bool
+  pub var armed: bool
+  pub var off_at: i64
+  // Why the box did not turn off when told to, until it is armed again.
+  pub var power_error: String
 }
 
 // Tokens a task used against one limit window of a box's provider since
@@ -142,6 +152,7 @@ pub struct Board : Send {
   pub fn stop(var self&, id: str, now: i64): () ! Refusal;
   pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
   pub fn set_model(var self&, id: str, model: str, now: i64): () ! Refusal;
+  pub fn arm_power_off(var self&, box_name: str, armed: bool): () ! Refusal;
   pub fn attach(var self&, hello&: Json, now: i64): String;
   pub fn detach(var self&, name: str, now: i64): ();
   pub fn apply(var self&, box_name: str, msg&: Json, now: i64): ();
@@ -164,6 +175,7 @@ pub struct Board : Send {
   fn emit(var self&, kind: str, data&: Json): ();
   fn touch_task(var self&, i: usize): ();
   fn spend(var self&, box_name: str, msg&: Json): ();
+  fn busy(self&, b: usize): bool;
   fn attribute(var self&, box_name: str, fresh&: Json): ();
   fn touch_box(var self&, b: usize): ();
 }
@@ -638,7 +650,8 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
     self.boxes.push(Box {
       name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
       models: from_str("{}"), usage: from_str("[]"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>(),
-      measured: new::<String>()
+      measured: new::<String>(), can_power_off: false, armed: false, off_at: 0,
+      power_error: String()
     });
   }
   self.boxes[b].host = string_of(hello, "host");
@@ -649,6 +662,12 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   self.boxes[b].sessions = from_str("[]");
   self.boxes[b].online = true;
   self.boxes[b].measured = new::<String>();
+  self.boxes[b].can_power_off = bool_of(hello, "poweroff") ?? false;
+  self.boxes[b].off_at = 0;
+  // Armed but no longer allowed, the switch would be out of reach.
+  if (!self.boxes[b].can_power_off) {
+    self.boxes[b].armed = false;
+  }
   self.boxes[b].last_seen = now;
   self.touch_box(b);
 
@@ -675,6 +694,15 @@ fn Board::detach(var self&, name: str, now: i64): () {
     self.boxes[b].online = false;
     self.boxes[b].sessions = from_str("[]");
     self.boxes[b].last_seen = now;
+    // A power-off the worker never got must not reach it on its return.
+    var k: usize = 0;
+    while (k < self.boxes[b].outbox.len()) {
+      if (contains(self.boxes[b].outbox[k].as_str(), "\"type\":\"poweroff\"")) {
+        let _ = self.boxes[b].outbox.remove(k);
+      } else {
+        k += 1;
+      }
+    }
     self.touch_box(b);
   }
 }
@@ -691,6 +719,13 @@ fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
     if (let b = self.find_box(box_name)) {
       self.attribute(box_name, msg);
       self.boxes[b].usage = merge_meters(self.boxes[b].usage.as_str(), msg);
+      self.touch_box(b);
+    }
+    return;
+  }
+  if (kind == "poweroff") {
+    if (let b = self.find_box(box_name)) {
+      self.boxes[b].power_error = string_of(msg, "error");
       self.touch_box(b);
     }
     return;
@@ -802,6 +837,60 @@ fn Board::sweep(var self&, now: i64): () {
       self.touch_task(i);
     }
   }
+  // Armed boxes: count down once idle, stop counting when busy again.
+  for (let b in 0usize..self.boxes.len()) {
+    if (!self.boxes[b].armed || !self.boxes[b].online || !self.boxes[b].can_power_off) {
+      continue;
+    }
+    if (self.busy(b)) {
+      if (self.boxes[b].off_at != 0) {
+        self.boxes[b].off_at = 0;
+        self.touch_box(b);
+      }
+    } else if (self.boxes[b].off_at == 0) {
+      self.boxes[b].off_at = now + kPowerOffMillis;
+      self.touch_box(b);
+    } else if (now >= self.boxes[b].off_at) {
+      var msg = object();
+      set(msg, "type", text("poweroff"));
+      self.boxes[b].outbox.push(to_string(msg));
+      // Disarmed, so the box stays on once it is back.
+      self.boxes[b].armed = false;
+      self.boxes[b].off_at = 0;
+      self.touch_box(b);
+    }
+  }
+}
+
+// A box is busy while one of its tasks works, stalled or not, or one of the
+// Claude Code sessions in its terminals does.
+fn Board::busy(self&, b: usize): bool {
+  let name = self.boxes[b].name.as_str();
+  for (let t& in self.tasks) {
+    if (t.box_name.as_str() == name && (t.state == TaskState::Working || t.state == TaskState::Stalled)) {
+      return true;
+    }
+  }
+  for (let s& in as_array(parse(self.boxes[b].sessions.as_str()) ?? Json::Null) ?? []) {
+    if ((str_of(s, "state") ?? "") == "working") {
+      return true;
+    }
+  }
+  return false;
+}
+
+fn Board::arm_power_off(var self&, box_name: str, armed: bool): () ! Refusal {
+  let b = self.find_box(box_name) else {
+    return fail Refusal::NoSuchBox;
+  };
+  if (armed && !self.boxes[b].can_power_off) {
+    return fail Refusal::CannotPowerOff;
+  }
+  self.boxes[b].armed = armed;
+  self.boxes[b].off_at = 0;
+  self.boxes[b].power_error = String();
+  self.touch_box(b);
+  return ();
 }
 
 fn Board::take_outbox(var self&, box_name: str): Vector<String> {
@@ -910,6 +999,12 @@ fn box_json(b&: Box): Json {
   set(o, "projects", parse(b.projects.as_str()) ?? array());
   set(o, "models", parse(b.models.as_str()) ?? object());
   set(o, "usage", parse(b.usage.as_str()) ?? array());
+  var power = object();
+  set(power, "can", boolean(b.can_power_off));
+  set(power, "armed", boolean(b.armed));
+  set(power, "at", number(b.off_at as f64));
+  set(power, "error", text(b.power_error.as_str()));
+  set(o, "poweroff", power);
   set(o, "stats", parse(b.stats.as_str()) ?? object());
   set(o, "sessions", parse(b.sessions.as_str()) ?? array());
   return o;
@@ -991,8 +1086,16 @@ fn Board::restore_box(var self&, j&: Json): () {
     name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
     agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
     models: models_text(j), usage: usage_text(j), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
-    outbox: new::<String>(), measured: new::<String>()
+    outbox: new::<String>(), measured: new::<String>(), can_power_off: power_flag(j, "can"),
+    armed: power_flag(j, "armed"), off_at: 0, power_error: String()
   });
+}
+
+fn power_flag(j&: Json, key: str): bool {
+  if (let power = get(j, "poweroff")) {
+    return bool_of(power, key) ?? false;
+  }
+  return false;
 }
 
 fn parse_id(s: str): u64? {

@@ -6,12 +6,13 @@ module worker::crew;
 
 import {String, from_str} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
-import {Json, array, push, text, get, as_array} from akibase::text::json;
+import {Json, object, set, array, push, text, get, as_array} from akibase::text::json;
 import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
 import {Atomic} from akibase::atomic;
 import {Thread, spawn} from akibase::threading::thread;
-import {send_signal, kSignalTerminate} from akibase::process::child;
+import {Command, send_signal, kSignalTerminate} from akibase::process::child;
+import {output_of} from worker::command;
 import {replace} from akibase::algorithm;
 import {str_of, string_of, bool_of} from wire::fields;
 import {said, entry_message} from worker::entry;
@@ -69,6 +70,20 @@ fn Crew::order(var self&, msg&: Json): () {
   }
   if (kind == "watch") {
     self.watch(task, str_of(msg, "session") ?? "");
+    return;
+  }
+  if (kind == "poweroff") {
+    // Whatever still runs ends with the machine. Without a terminal, and
+    // told not to ask, systemctl answers at once rather than prompt.
+    var c = Command("systemctl");
+    c.arg("--no-ask-password");
+    c.arg("poweroff");
+    if (output_of(c, "poweroff") == none) {
+      var m = object();
+      set(m, "type", text("poweroff"));
+      set(m, "error", text("systemctl poweroff failed on the box."));
+      post(self.outbox, m);
+    }
     return;
   }
   if (kind != "turn") {

@@ -6,7 +6,7 @@ module worker::inventory;
 
 import {String, from_str} from akibase::strings::base_string;
 import {new} from akibase::containers::vector;
-import {Json, object, array, set, push, text, number} from akibase::text::json;
+import {Json, object, array, set, push, text, number, boolean} from akibase::text::json;
 import {get_environment_variable} from akibase::environment_variables;
 import {read_file, path_exists} from akibase::filesystem::file_util;
 import {is_directory, list_directory} from akibase::filesystem::directory;
@@ -18,6 +18,9 @@ import {sort} from akibase::algorithm;
 import {opencode_models} from worker::opencode;
 import {private_temp} from worker::turn;
 import {system_now} from akibase::time::time;
+import {Command} from akibase::process::child;
+import {output_of} from worker::command;
+import {contains} from akibase::strings::string_search;
 
 pub fn hostname(): String {
   let name = read_file("/proc/sys/kernel/hostname") ?? from_str("box");
@@ -96,9 +99,23 @@ pub fn hello(token: str, name: str, roots&: [String], models: Json, running: Jso
   set(h, "os", text(os_name().as_str()));
   set(h, "agents", agents);
   set(h, "models", models);
+  set(h, "poweroff", boolean(can_power_off()));
   set(h, "projects", repositories(roots));
   set(h, "running", running);
   return h;
+}
+
+// Whether logind lets this user turn the machine off without asking for a
+// password, as it does for an active local session.
+fn can_power_off(): bool {
+  var c = Command("busctl");
+  for (let a in ["call", "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "CanPowerOff"]) {
+    c.arg(a);
+  }
+  let answer = output_of(c, "power") else {
+    return false;
+  };
+  return contains(answer.as_str(), "\"yes\"");
 }
 
 fn meminfo_kb(info: str, key: str): f64 {

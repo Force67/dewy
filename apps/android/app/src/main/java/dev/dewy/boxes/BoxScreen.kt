@@ -18,7 +18,10 @@ import androidx.compose.material.icons.automirrored.rounded.ArrowBackIos
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Terminal
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -32,7 +35,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import dev.dewy.net.Box as DewyBox
+import dev.dewy.net.PowerOff
 import dev.dewy.net.Task
+import dev.dewy.net.TaskState
 import dev.dewy.ui.AgentMark
 import dev.dewy.ui.CardShape
 import dev.dewy.ui.Group
@@ -55,6 +60,7 @@ fun BoxScreen(
     onOpenTask: (Task) -> Unit,
     onStartIn: (box: String, project: String) -> Unit,
     onAttach: (box: String, session: String) -> Unit,
+    onArmPowerOff: (box: String, armed: Boolean) -> Unit,
 ) {
     val p = LocalPalette.current
     Scaffold(
@@ -114,6 +120,34 @@ fun BoxScreen(
                             AgentMark(agent, size = 28.dp)
                             Spacer(Modifier.size(12.dp))
                             Text(agentLabel(agent), style = Type.body, color = p.ink)
+                        }
+                    }
+                }
+            }
+            if (box.online && box.poweroff.can) {
+                item {
+                    val running = tasks.count { it.box == box.name && it.state.isLive }
+                    val sessions = box.sessions.count { it.state == TaskState.Working }
+                    Group("Power") {
+                        Row(
+                            Modifier.padding(start = 16.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Rounded.PowerSettingsNew, null, tint = if (box.poweroff.armed) p.coral else p.inkSoft, modifier = Modifier.size(22.dp))
+                            Spacer(Modifier.size(14.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Turn off when tasks finish", style = Type.body, color = p.ink)
+                                Text(
+                                    powerOffNote(box.poweroff, running, sessions, rememberNow(1_000)),
+                                    style = Type.footnote,
+                                    color = if (box.poweroff.at > 0 || box.poweroff.error.isNotEmpty()) p.coral else p.inkSoft,
+                                )
+                            }
+                            Switch(
+                                checked = box.poweroff.armed,
+                                onCheckedChange = { onArmPowerOff(box.name, it) },
+                                colors = SwitchDefaults.colors(checkedTrackColor = p.coral),
+                            )
                         }
                     }
                 }
@@ -194,6 +228,21 @@ private fun Meter(label: String, value: String, note: String, fraction: Float, m
         } else {
             Spacer(Modifier.height(12.dp))
         }
+    }
+}
+
+/** What the switch will do, or is doing: "Turning off in 42 s". */
+fun powerOffNote(power: PowerOff, running: Int, sessions: Int, now: Long): String {
+    val waiting = listOfNotNull(
+        running.takeIf { it > 0 }?.let { if (it == 1) "1 task" else "$it tasks" },
+        sessions.takeIf { it > 0 }?.let { if (it == 1) "1 terminal session" else "$it terminal sessions" },
+    )
+    return when {
+        power.armed && power.at > 0 -> "Turning off in ${((power.at - now + 999) / 1000).coerceAtLeast(0)} s"
+        power.armed && waiting.isNotEmpty() -> "Waiting for ${waiting.joinToString(" and ")} to finish"
+        power.armed -> "Once nothing runs here"
+        power.error.isNotEmpty() -> power.error
+        else -> "Shuts the machine down a minute after its last task ends"
     }
 }
 

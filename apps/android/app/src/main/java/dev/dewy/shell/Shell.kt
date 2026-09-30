@@ -129,6 +129,7 @@ fun Shell(
         attach = { box, session ->
             scope.launch { runCatching { store.attachSession(box, session, yolo) }.onSuccess { openDetail(Route.Thread(it.id)) } }
         },
+        armPowerOff = { box, armed -> scope.launch { runCatching { store.armPowerOff(box, armed) } } },
     )
 
     BoxWithConstraints(Modifier.fillMaxSize().background(LocalPalette.current.ground)) {
@@ -173,6 +174,7 @@ private class Screens(
     val compose: (Draft) -> Unit,
     val archive: (Task, Boolean) -> Unit,
     val attach: (box: String, session: String) -> Unit,
+    val armPowerOff: (box: String, armed: Boolean) -> Unit,
 ) {
     val board: Board get() = boardState.value
     val seen: Map<String, Long> get() = seenState.value
@@ -238,6 +240,7 @@ private class Screens(
                 onOpenTask = { openDetail(Route.Thread(it.id)) },
                 onStartIn = { box, project -> compose(Draft(box, project)) },
                 onAttach = attach,
+                onArmPowerOff = armPowerOff,
             )
             Route.Settings -> SettingsScreen(settings, board, onBack)
             Route.Usage -> UsageScreen(board.boxes, settings, onBack)

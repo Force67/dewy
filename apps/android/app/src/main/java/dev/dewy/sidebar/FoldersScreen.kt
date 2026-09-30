@@ -120,6 +120,7 @@ fun FoldersScreen(
                             iconTint = if (box.online) p.dew else p.inkFaint,
                             subtitle = when {
                                 !box.online -> "Offline"
+                                box.poweroff.armed -> "Turns off when done"
                                 working > 0 -> "$working working"
                                 else -> "Online"
                             },

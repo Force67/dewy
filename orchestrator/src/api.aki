@@ -9,6 +9,7 @@
 //   POST /api/tasks/<id>/stop
 //   POST /api/tasks/<id>/archive      {archived}
 //   POST /api/tasks/<id>/model        {model}: the model for the turns after
+//   POST /api/boxes/<name>/poweroff   {armed}: turn the box off once its tasks are done
 //   POST /api/sessions/attach         {box, session, yolo}: follow a terminal session as a task
 //   POST /api/images                  an image's bytes, with its Content-Type: {id}
 //   GET  /api/images/<id>             the image's bytes
@@ -68,6 +69,7 @@ fn refusal_reply(r: Refusal): Reply {
     Refusal::Empty => 400,
     Refusal::UnknownAgent => 400,
     Refusal::UnknownModel => 400,
+    Refusal::CannotPowerOff => 409,
   };
   return error_reply(status, refusal_message(r));
 }
@@ -229,6 +231,9 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
   if (post && path == "/api/sessions/attach") {
     return attach_session(r, hub);
   }
+  if (post && n == 5 && parts[1] == "api" && parts[2] == "boxes" && parts[4] == "poweroff") {
+    return arm_power_off(r, parts[3], hub);
+  }
   if (n < 4 || parts[1] != "api" || parts[2] != "tasks") {
     return error_reply(404, "no such route");
   }
@@ -273,6 +278,18 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
     }
     return fail Refusal::NoSuchTask;
   });
+  hub.changed.notify_all();
+  if (let _ = result) {
+    return ok_reply();
+  } else (let e) {
+    return refusal_reply(e);
+  }
+}
+
+fn arm_power_off(r&: Request, name: str, hub&: Hub): Reply {
+  let body = body_json(r) ?? object();
+  let armed = bool_of(body, "armed") ?? false;
+  let result = hub.board.with(fn(b: &var Board): () ! Refusal => b.arm_power_off(name, armed));
   hub.changed.notify_all();
   if (let _ = result) {
     return ok_reply();

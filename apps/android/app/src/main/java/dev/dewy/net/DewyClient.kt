@@ -100,6 +100,9 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
 
     suspend fun stop(id: String) = post("api/tasks/$id/stop", "{}")
 
+    suspend fun armPowerOff(box: String, armed: Boolean) =
+        post("api/boxes/$box/poweroff", buildJsonObject { put("armed", JsonPrimitive(armed)) }.toString())
+
     suspend fun setModel(id: String, model: String) =
         post("api/tasks/$id/model", buildJsonObject { put("model", model) }.toString())
 

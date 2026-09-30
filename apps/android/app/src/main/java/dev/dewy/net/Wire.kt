@@ -95,6 +95,7 @@ data class Box(
     /** The models each agent offers, where the box lists them. */
     val models: Map<String, List<String>> = emptyMap(),
     val usage: List<Meter> = emptyList(),
+    val poweroff: PowerOff = PowerOff(),
     val stats: BoxStats = BoxStats(),
     val sessions: List<TerminalSession> = emptyList(),
 )
@@ -119,6 +120,14 @@ data class Limit(val name: String = "", val used: Double = 0.0, val resets: Long
 
 @Serializable
 data class Spend(val name: String = "", val cost: Double = 0.0, val tokens: Double = 0.0)
+
+/**
+ * Whether a box can turn itself off, whether it will once its tasks are
+ * done, and when, as Unix milliseconds, while counting down (0 otherwise);
+ * [error] says why it did not turn off when told to.
+ */
+@Serializable
+data class PowerOff(val can: Boolean = false, val armed: Boolean = false, val at: Long = 0, val error: String = "")
 
 /** A Claude Code session running in a terminal on a box, which a task can follow. */
 @Serializable
