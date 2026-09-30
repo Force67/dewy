@@ -1,5 +1,6 @@
-// Real output of `claude -p ... --output-format stream-json` and
-// `codex exec --json`, trimmed, through the translators.
+// Real output of `claude -p ... --output-format stream-json`,
+// `codex exec --json`, and `opencode run --format json`, trimmed, through
+// the translators.
 
 module transcript_test;
 
@@ -11,6 +12,7 @@ import {eprintln} from akibase::logging;
 import {Transcript} from worker::transcript;
 import {read_claude, read_terminal, claude_input} from worker::claude_code;
 import {read_codex} from worker::codex;
+import {read_opencode} from worker::opencode;
 
 comptime let kClaude: str = r"""
 {"type":"system","subtype":"init","session_id":"2896"}
@@ -29,6 +31,16 @@ comptime let kCodex: str = r"""
 {"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/run/current-system/sw/bin/bash -lc ls","aggregated_output":"a.txt\n","exit_code":0,"status":"completed"}}
 {"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Done"}}
 {"type":"turn.completed","usage":{"input_tokens":33352}}
+""";
+
+comptime let kOpenCode: str = r"""
+{"type":"step_start","timestamp":1790777185236,"sessionID":"ses_f0d5","part":{"id":"prt_0","type":"step-start"}}
+{"type":"tool_use","timestamp":1790777186690,"sessionID":"ses_f0d5","part":{"type":"tool","tool":"bash","callID":"call-f8","state":{"status":"completed","input":{"command":"ls"},"output":"a.txt\n","metadata":{"output":"a.txt\n","exit":0,"truncated":false},"title":"ls"},"id":"prt_1"}}
+{"type":"tool_use","timestamp":1790777213777,"sessionID":"ses_f0d5","part":{"type":"tool","tool":"bash","callID":"call-f9","state":{"status":"completed","input":{"command":"false"},"output":"(no output)","metadata":{"exit":1},"title":"false"},"id":"prt_2"}}
+{"type":"tool_use","timestamp":1790777194016,"sessionID":"ses_f0d5","part":{"type":"tool","tool":"read","callID":"call-57","state":{"status":"error","input":{"filePath":"/src/b.txt"},"error":"File not found"},"id":"prt_3"}}
+{"type":"step_finish","timestamp":1790777194430,"sessionID":"ses_f0d5","part":{"id":"prt_4","reason":"tool-calls","type":"step-finish"}}
+{"type":"text","timestamp":1790777197474,"sessionID":"ses_f0d5","part":{"id":"prt_5","type":"text","text":"hi"}}
+{"type":"error","timestamp":1790777205145,"sessionID":"ses_f0d5","error":{"name":"UnknownError","data":{"message":"Unexpected server error."}}}
 """;
 
 // A terminal session's transcript: a typed prompt, injected context, a
@@ -67,7 +79,8 @@ fn run(text: str, agent: str, var t&: Transcript): Vector<String> {
     let j = parse(line) else {
       continue;
     };
-    let entries = agent == "claude" ? read_claude(t, j) : agent == "codex" ? read_codex(t, j) : read_terminal(t, j);
+    let entries = agent == "claude" ? read_claude(t, j) : agent == "codex" ? read_codex(t, j)
+      : agent == "opencode" ? read_opencode(t, j) : read_terminal(t, j);
     for (let e& in entries) {
       out.push(to_string(without_at(e)));
     }
@@ -116,6 +129,24 @@ pub fn main(): i32 {
         "codex command start", failures);
   check(xe[2].as_str() == "{\"id\":\"t2.item_1\",\"state\":\"ok\",\"output\":\"a.txt\\n\"}", "codex command end", failures);
   check(xe[3].as_str() == "{\"id\":\"t2.item_2\",\"kind\":\"agent\",\"text\":\"Done\"}", "codex text", failures);
+
+  var oc = Transcript("t4", "");
+  let oe = run(kOpenCode, "opencode", oc);
+  check(oc.session.as_str() == "ses_f0d5", "opencode session", failures);
+  check(oe.len() == 8, "opencode entry count", failures);
+  check(oe.len() == 8 && oe[0].as_str() == "{\"id\":\"t4.prt_1\",\"kind\":\"tool\",\"tool\":\"bash\",\"detail\":\"ls\",\"state\":\"running\"}",
+        "opencode tool start", failures);
+  check(oe.len() == 8 && oe[1].as_str() == "{\"id\":\"t4.prt_1\",\"state\":\"ok\",\"output\":\"a.txt\\n\"}", "opencode tool end", failures);
+  check(oe.len() == 8 && oe[3].as_str() == "{\"id\":\"t4.prt_2\",\"state\":\"error\",\"output\":\"(no output)\"}",
+        "opencode command that exited non-zero", failures);
+  check(oe.len() == 8 && oe[4].as_str() == "{\"id\":\"t4.prt_3\",\"kind\":\"tool\",\"tool\":\"read\",\"detail\":\"/src/b.txt\",\"state\":\"running\"}",
+        "opencode file tool start", failures);
+  check(oe.len() == 8 && oe[5].as_str() == "{\"id\":\"t4.prt_3\",\"state\":\"error\",\"output\":\"File not found\"}",
+        "opencode tool error", failures);
+  check(oe.len() == 8 && oe[6].as_str() == "{\"id\":\"t4.prt_5\",\"kind\":\"agent\",\"text\":\"hi\"}", "opencode text", failures);
+  check(oe.len() == 8 && oe[7].as_str() == "{\"id\":\"t4.m1\",\"kind\":\"error\",\"text\":\"Unexpected server error.\"}",
+        "opencode error", failures);
+  check(oc.failed, "opencode error fails the turn", failures);
 
   var w = Transcript("w", "bcef");
   let we = run(kTerminal, "terminal", w);

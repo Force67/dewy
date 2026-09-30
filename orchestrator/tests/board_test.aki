@@ -27,17 +27,18 @@ pub fn main(): i32 {
   let none_images = array();
   let hello = parse("{\"type\":\"hello\",\"box\":\"forge\",\"host\":\"forge.lan\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[]}")!;
 
-  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", none_images, false, 1000)) {
+  if (let _ = b.create_task("forge", "/src/dewy", "claude", "", "fix it", none_images, false, 1000)) {
     check(false, "an unknown box takes no task", failures);
   } else (let e) {
     check(e == Refusal::NoSuchBox, "unknown box", failures);
   }
 
   let _ = b.attach(hello, 1000);
-  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", none_images, false, 1000)) {
+  check(contains(to_string(b.boxes_json()).as_str(), "\"models\":{}"), "a box that lists no models has none", failures);
+  if (let _ = b.create_task("forge", "/src/dewy", "codex", "", "fix it", none_images, false, 1000)) {
     check(false, "an agent the box lacks is refused", failures);
   }
-  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", none_images, false, 1000)!;
+  let id = b.create_task("forge", "/src/dewy", "claude", "", "fix the flaky test\nthen push", none_images, false, 1000)!;
   check(id.as_str() == "1", "ids count up", failures);
 
   let out = b.take_outbox("forge");
@@ -99,7 +100,7 @@ pub fn main(): i32 {
   check(contains(to_string(b.task_json(watched.as_str())!).as_str(), "\"title\":\"Rust port\""), "the worker names the task", failures);
 
   let _ = b.take_outbox("forge");
-  let wild = b.create_task("forge", "/src/dewy", "claude", "go", none_images, true, 850000)!;
+  let wild = b.create_task("forge", "/src/dewy", "claude", "", "go", none_images, true, 850000)!;
   let turns = b.take_outbox("forge");
   check(turns.len() == 1 && contains(turns[0].as_str(), "\"yolo\":true"), "a yolo task's turn says so", failures);
   let _ = b.steer(wild.as_str(), "again", none_images, 850001);
@@ -114,13 +115,35 @@ pub fn main(): i32 {
   // Images: the thread keeps their ids, the worker's turn gets their data.
   let _ = b.take_outbox("forge");
   let pictures = parse("[{\"id\":\"ab12\",\"type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}]")!;
-  let shot = b.create_task("forge", "/src/dewy", "claude", "", pictures, false, 860000)!;
+  let shot = b.create_task("forge", "/src/dewy", "claude", "", "", pictures, false, 860000)!;
   let shown = to_string(b.task_json(shot.as_str())!);
   check(contains(shown.as_str(), "\"title\":\"Image\""), "an image alone is a task named Image", failures);
   check(contains(shown.as_str(), "\"images\":[{\"id\":\"ab12\",\"type\":\"image/png\"}]"), "the thread keeps the ids", failures);
   check(!contains(shown.as_str(), "iVBOR"), "and not the data", failures);
   let sent = b.take_outbox("forge");
   check(sent.len() == 1 && contains(sent[0].as_str(), "\"data\":\"iVBORw0KGgo=\""), "the turn carries the data", failures);
+
+  // Models: a task runs the one picked, from those the box lists.
+  let _ = b.attach(parse("{\"type\":\"hello\",\"box\":\"lab\",\"agents\":[\"opencode\"],\"models\":{\"opencode\":[\"opencode/big-pickle\",\"opencode-go/kimi-k3\"]},\"projects\":[],\"running\":[]}")!, 870000);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"models\":{\"opencode\":[\"opencode/big-pickle\""), "a box shows its models", failures);
+  if (let _ = b.create_task("lab", "/src/dewy", "opencode", "gpt-9", "go", none_images, false, 870001)) {
+    check(false, "a model the box lacks is refused", failures);
+  } else (let e) {
+    check(e == Refusal::UnknownModel, "unknown model", failures);
+  }
+  let picked = b.create_task("lab", "/src/dewy", "opencode", "opencode/big-pickle", "go", none_images, false, 870002)!;
+  let first = b.take_outbox("lab");
+  check(first.len() == 1 && contains(first[0].as_str(), "\"model\":\"opencode/big-pickle\""), "the turn runs the model", failures);
+  check(contains(to_string(b.task_json(picked.as_str())!).as_str(), "\"model\":\"opencode/big-pickle\""), "the task shows it", failures);
+  if (let _ = b.set_model(picked.as_str(), "nope/nope", 870003)) {
+    check(false, "switching to an unknown model is refused", failures);
+  }
+  let _ = b.set_model(picked.as_str(), "opencode-go/kimi-k3", 870004);
+  let _ = b.steer(picked.as_str(), "again", none_images, 870005);
+  let next = b.take_outbox("lab");
+  check(next.len() == 1 && contains(next[0].as_str(), "\"model\":\"opencode-go/kimi-k3\""), "later turns run the new model", failures);
+  let _ = b.set_model(picked.as_str(), "", 870006);
+  check(contains(to_string(b.task_json(picked.as_str())!).as_str(), "\"model\":\"\""), "empty is the default", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

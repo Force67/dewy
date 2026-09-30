@@ -1,11 +1,11 @@
 # dewy
 
-Steer your coding agents from your phone. Claude Code and Codex run on your own machines ("boxes"); dewy shows every task in a mail-style inbox, streams what each agent is doing as it happens, lets you reply to steer it, and pings your phone when a turn finishes, fails, or goes quiet.
+Steer your coding agents from your phone. Claude Code, Codex, and opencode run on your own machines ("boxes"); dewy shows every task in a mail-style inbox, streams what each agent is doing as it happens, lets you reply to steer it, and pings your phone when a turn finishes, fails, or goes quiet.
 
 ```
  phone (apps/android) ──HTTP + SSE──▶ orchestrator ◀──NDJSON over TCP── worker (one per box)
                                                                            │
-                                                              claude -p / codex exec
+                                                              claude -p / codex exec / opencode run
 ```
 
 | Directory | What it is |
@@ -50,7 +50,7 @@ Enter the orchestrator's address and token on first launch.
 ## Things to know
 
 - Everything is plain HTTP with a shared bearer token. Keep it on a private network such as a tailnet, or put a TLS proxy in front of port 8787.
-- Agents run unattended. By default Claude Code runs with `--permission-mode acceptEdits` and Codex in its `workspace-write` sandbox; commands they may not run show up in the thread as notes. Yolo mode, switched on per task when you start it, lifts both limits; `worker --yolo` lifts them for every task on a box. Anyone with the token can start a yolo task, so keep the token to yourself.
+- Agents run unattended. By default Claude Code runs with `--permission-mode acceptEdits` and Codex in its `workspace-write` sandbox; commands they may not run show up in the thread as notes. opencode runs with its own configured permissions, and the model it uses is picked per task in the app. Yolo mode, switched on per task when you start it, lifts these limits; `worker --yolo` lifts them for every task on a box. Anyone with the token can start a yolo task, so keep the token to yourself.
 - A task that says nothing for three minutes while working is marked stalled, and the app offers to nudge or stop it.
 - A box's page lists the Claude Code sessions running in its terminals. Tapping one follows it as a task; replying ends it in the terminal and continues it from the phone.
 - Notifications need no Google services: while agents work, the app keeps a foreground service with a live notification that holds the event stream open. Tasks that start while the app has been closed are noticed when it next opens.

@@ -41,7 +41,7 @@ pub fn state_named(name: str): TaskState? => match (name) {
 };
 
 // Why the board turned a request down.
-pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, NoSuchSession, Empty, UnknownAgent }
+pub enum Refusal { NoSuchBox, BoxOffline, NoSuchTask, NoSuchSession, Empty, UnknownAgent, UnknownModel }
 
 pub fn refusal_message(r: Refusal): str<'static> => match (r) {
   Refusal::NoSuchBox => "no such box",
@@ -50,6 +50,7 @@ pub fn refusal_message(r: Refusal): str<'static> => match (r) {
   Refusal::NoSuchSession => "the box lists no such session",
   Refusal::Empty => "the message is empty",
   Refusal::UnknownAgent => "the box has no such agent",
+  Refusal::UnknownModel => "the box has no such model",
 };
 
 pub struct Task : Send {
@@ -57,6 +58,8 @@ pub struct Task : Send {
   pub var box_name: String
   pub var project: String
   pub var agent: String
+  // provider/model, empty for the agent's default.
+  pub var model: String
   pub var title: String
   pub var session: String
   pub var preview: String
@@ -81,6 +84,8 @@ pub struct Box : Send {
   // JSON text: an array of agent names, an array of {name, path}, an object.
   pub var agents: String
   pub var projects: String
+  // JSON text: the models the box lists, by agent.
+  pub var models: String
   pub var stats: String
   // JSON text: the Claude Code sessions running in terminals on the box, as
   // the worker last listed them.
@@ -107,12 +112,13 @@ pub struct Board : Send {
 
   pub fn Board(): Board;
   pub fn last_seq(self&): u64;
-  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, images&: Json, yolo: bool, now: i64)
-    : String ! Refusal;
+  pub fn create_task(var self&, box_name: str, project: str, agent: str, model: str, prompt: str, images&: Json, yolo: bool,
+    now: i64): String ! Refusal;
   pub fn attach_session(var self&, box_name: str, session: str, yolo: bool, now: i64): String ! Refusal;
   pub fn steer(var self&, id: str, prompt: str, images&: Json, now: i64): () ! Refusal;
   pub fn stop(var self&, id: str, now: i64): () ! Refusal;
   pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
+  pub fn set_model(var self&, id: str, model: str, now: i64): () ! Refusal;
   pub fn attach(var self&, hello&: Json, now: i64): String;
   pub fn detach(var self&, name: str, now: i64): ();
   pub fn apply(var self&, box_name: str, msg&: Json, now: i64): ();
@@ -128,6 +134,7 @@ pub struct Board : Send {
   pub fn restore_box(var self&, j&: Json): ();
   fn find_task(self&, id: str): usize?;
   fn find_box(self&, name: str): usize?;
+  fn has_model(self&, b: usize, agent: str, model: str): bool;
   fn send_turn(var self&, i: usize, prompt: str, images&: Json, now: i64): ();
   fn put_entry(var self&, i: usize, entry: Json, now: i64): ();
   fn set_state(var self&, i: usize, state: TaskState, now: i64): ();
@@ -182,8 +189,8 @@ fn listed(obj&: Json, key: str, value: str): bool {
   return has_text(list, value);
 }
 
-fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, images&: Json, yolo: bool, now: i64)
-  : String ! Refusal {
+fn Board::create_task(var self&, box_name: str, project: str, agent: str, model: str, prompt: str, images&: Json, yolo: bool,
+  now: i64): String ! Refusal {
   let b = self.find_box(box_name) else {
     return fail Refusal::NoSuchBox;
   };
@@ -192,6 +199,9 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
   }
   if (!has_text(parse(self.boxes[b].agents.as_str()) ?? Json::Null, agent)) {
     return fail Refusal::UnknownAgent;
+  }
+  if (!self.has_model(b, agent, model)) {
+    return fail Refusal::UnknownModel;
   }
   if (#trim(prompt) == 0 && image_count(images) == 0) {
     return fail Refusal::Empty;
@@ -204,7 +214,7 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
     title = from_str("Image");
   }
   self.tasks.push(Task {
-    id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent),
+    id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent), model: from_str(model),
     title, session: String(), preview: String(), activity: String(),
     state: TaskState::Working, archived: false, yolo, created: now, updated: now, turns: 0, entries: new::<String>(),
     entry_ids: new::<String>()
@@ -257,7 +267,7 @@ fn Board::attach_session(var self&, box_name: str, session: str, yolo: bool, now
   }
   self.tasks.push(Task {
     id: id.clone(), box_name: from_str(box_name), project: string_of(s, "project"), agent: from_str("claude"),
-    title, session: from_str(session), preview: String(), activity: String(),
+    model: String(), title, session: from_str(session), preview: String(), activity: String(),
     state: working ? TaskState::Working : TaskState::Idle, archived: false, yolo, created: now, updated: now, turns: 0,
     entries: new::<String>(), entry_ids: new::<String>()
   });
@@ -328,6 +338,7 @@ fn Board::send_turn(var self&, i: usize, prompt: str, images&: Json, now: i64): 
   set(msg, "session", text(self.tasks[i].session.as_str()));
   set(msg, "text", text(prompt));
   set(msg, "yolo", boolean(self.tasks[i].yolo));
+  set(msg, "model", text(self.tasks[i].model.as_str()));
   if (image_count(images) > 0) {
     set(msg, "images", copy(images));
   }
@@ -351,6 +362,44 @@ fn Board::stop(var self&, id: str, now: i64): () ! Refusal {
   return ();
 }
 
+// The turns after run on `model`; empty for the agent's default.
+fn Board::set_model(var self&, id: str, model: str, now: i64): () ! Refusal {
+  let i = self.find_task(id) else {
+    return fail Refusal::NoSuchTask;
+  };
+  let b = self.find_box(self.tasks[i].box_name.as_str()) else {
+    return fail Refusal::NoSuchBox;
+  };
+  if (!self.has_model(b, self.tasks[i].agent.as_str(), model)) {
+    return fail Refusal::UnknownModel;
+  }
+  self.tasks[i].model = from_str(model);
+  self.tasks[i].updated = now;
+  self.touch_task(i);
+  return ();
+}
+
+// A hello or saved box from before models were listed has none.
+fn models_text(j&: Json): String {
+  if (let m = get(j, "models")) {
+    match (m) {
+      Json::Obj(let _members&) => {
+        return to_string(m);
+      }
+      _ => {}
+    }
+  }
+  return from_str("{}");
+}
+
+fn Board::has_model(self&, b: usize, agent: str, model: str): bool {
+  if (#model == 0) {
+    return true;
+  }
+  let models = parse(self.boxes[b].models.as_str()) ?? Json::Null;
+  return listed(models, agent, model);
+}
+
 fn Board::archive(var self&, id: str, archived: bool, now: i64): () ! Refusal {
   let i = self.find_task(id) else {
     return fail Refusal::NoSuchTask;
@@ -369,13 +418,14 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   if (b == self.boxes.len()) {
     self.boxes.push(Box {
       name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
-      stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
+      models: from_str("{}"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
     });
   }
   self.boxes[b].host = string_of(hello, "host");
   self.boxes[b].os = string_of(hello, "os");
   self.boxes[b].agents = to_string(get(hello, "agents") ?? Json::Null);
   self.boxes[b].projects = to_string(get(hello, "projects") ?? Json::Null);
+  self.boxes[b].models = models_text(hello);
   self.boxes[b].sessions = from_str("[]");
   self.boxes[b].online = true;
   self.boxes[b].last_seen = now;
@@ -597,6 +647,7 @@ fn summary_json(t&: Task): Json {
   set(o, "box", text(t.box_name.as_str()));
   set(o, "project", text(t.project.as_str()));
   set(o, "agent", text(t.agent.as_str()));
+  set(o, "model", text(t.model.as_str()));
   set(o, "title", text(t.title.as_str()));
   set(o, "session", text(t.session.as_str()));
   set(o, "preview", text(t.preview.as_str()));
@@ -619,6 +670,7 @@ fn box_json(b&: Box): Json {
   set(o, "lastSeen", number(b.last_seen as f64));
   set(o, "agents", parse(b.agents.as_str()) ?? array());
   set(o, "projects", parse(b.projects.as_str()) ?? array());
+  set(o, "models", parse(b.models.as_str()) ?? object());
   set(o, "stats", parse(b.stats.as_str()) ?? object());
   set(o, "sessions", parse(b.sessions.as_str()) ?? array());
   return o;
@@ -678,7 +730,7 @@ fn Board::restore_task(var self&, j&: Json): () {
   }
   self.tasks.push(Task {
     id, box_name: string_of(j, "box"), project: string_of(j, "project"), agent: string_of(j, "agent"),
-    title: string_of(j, "title"), session: string_of(j, "session"), preview: string_of(j, "preview"),
+    model: string_of(j, "model"), title: string_of(j, "title"), session: string_of(j, "session"), preview: string_of(j, "preview"),
     activity: String(), state, archived: bool_of(j, "archived") ?? false, yolo: bool_of(j, "yolo") ?? false,
     created: (num_of(j, "created") ?? 0.0) as i64, updated: (num_of(j, "updated") ?? 0.0) as i64,
     turns: (num_of(j, "turns") ?? 0.0) as u32, entries, entry_ids
@@ -689,7 +741,7 @@ fn Board::restore_box(var self&, j&: Json): () {
   self.boxes.push(Box {
     name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
     agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
-    stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
+    models: models_text(j), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
     outbox: new::<String>()
   });
 }

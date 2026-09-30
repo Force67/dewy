@@ -14,7 +14,10 @@ data class Connection(val serverUrl: String, val token: String)
 
 private val Context.connectionStore: DataStore<Preferences> by preferencesDataStore("connection")
 
-/** Where the orchestrator is, the token for it, whether to notify, and whether new tasks start in yolo mode. */
+/**
+ * Where the orchestrator is, the token for it, whether to notify, whether
+ * new tasks start in yolo mode, and the model picked last.
+ */
 class ConnectionSettings(context: Context) {
     private val store = context.connectionStore
 
@@ -28,6 +31,8 @@ class ConnectionSettings(context: Context) {
 
     val yolo: Flow<Boolean> = store.data.map { it[yoloKey] ?: false }
 
+    val model: Flow<String> = store.data.map { it[modelKey] ?: "" }
+
     suspend fun save(connection: Connection) = store.edit {
         it[urlKey] = connection.serverUrl
         it[tokenKey] = connection.token
@@ -39,10 +44,13 @@ class ConnectionSettings(context: Context) {
 
     suspend fun setYolo(on: Boolean) = store.edit { it[yoloKey] = on }
 
+    suspend fun setModel(model: String) = store.edit { it[modelKey] = model }
+
     private companion object {
         val urlKey = stringPreferencesKey("server_url")
         val tokenKey = stringPreferencesKey("token")
         val notifyKey = booleanPreferencesKey("notify")
         val yoloKey = booleanPreferencesKey("yolo")
+        val modelKey = stringPreferencesKey("model")
     }
 }

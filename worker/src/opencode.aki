@@ -1,0 +1,135 @@
+// opencode: `opencode run --format json <text>` writes one JSON event per
+// line, `-s <session>` continues a session, and `-m provider/model` picks
+// the model. A tool shows only once it ended, in a single event.
+
+module worker::opencode;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
+import {Command, exit_code} from akibase::process::child;
+import {Json, array, push, text, get, path} from akibase::text::json;
+import {read_file, delete_file} from akibase::filesystem::file_util;
+import {lines} from akibase::strings::string_util;
+import {trim} from akibase::strings::string_search;
+import {seconds} from akibase::time::time;
+import {str_of, num_of} from wire::fields;
+import {said, tool_started, tool_finished} from worker::entry;
+import {Transcript} from worker::transcript;
+
+pub fn opencode_command(text: str, session: str, model: str, yolo: bool, images&: [String]): Command {
+  var c = Command("opencode");
+  c.arg("run");
+  c.arg("--format");
+  c.arg("json");
+  if (#session > 0) {
+    c.arg("-s");
+    c.arg(session);
+  }
+  if (#model > 0) {
+    c.arg("-m");
+    c.arg(model);
+  }
+  if (yolo) {
+    c.arg("--auto");
+  }
+  for (let p& in images) {
+    c.arg("-f");
+    c.arg(p.as_str());
+  }
+  // -f takes several files, and a prompt may start with a dash.
+  c.arg("--");
+  c.arg(#text > 0 ? text : "See the attached images.");
+  return c;
+}
+
+// The models `opencode models` lists, empty when it fails or hangs.
+pub fn opencode_models(out_path: str): Json {
+  var list = array();
+  var c = Command("opencode");
+  c.arg("models");
+  c.stdin_from("/dev/null");
+  c.stdout_to(out_path);
+  c.stderr_to("/dev/null");
+  var child = c.spawn() else (let e) {
+    return list;
+  };
+  if (let status = child.wait_timeout(seconds(20))) {
+    if (exit_code(status) != 0) {
+      let _ = delete_file(out_path);
+      return list;
+    }
+    let listed = read_file(out_path) ?? String();
+    for (let line in lines(listed.as_str())) {
+      let model = trim(line);
+      if (#model > 0) {
+        push(list, text(model));
+      }
+    }
+  } else {
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  let _ = delete_file(out_path);
+  return list;
+}
+
+pub fn read_opencode(var t&: Transcript, line&: Json): Vector<Json> {
+  var out = new::<Json>();
+  if (let s = str_of(line, "sessionID")) {
+    t.session = from_str(s);
+  }
+  let kind = str_of(line, "type") ?? "";
+  if (kind == "text") {
+    let part = get(line, "part") else {
+      return out;
+    };
+    let body = str_of(part, "text") ?? "";
+    if (#trim(body) > 0) {
+      out.push(said(t.id_for(str_of(part, "id") ?? "").as_str(), "agent", body));
+    }
+  } else if (kind == "tool_use") {
+    let part = get(line, "part") else {
+      return out;
+    };
+    let id = t.id_for(str_of(part, "id") ?? "");
+    out.push(tool_started(id.as_str(), str_of(part, "tool") ?? "tool", tool_detail(part)));
+    let state = get(part, "state") else {
+      return out;
+    };
+    if ((str_of(state, "status") ?? "") == "error") {
+      out.push(tool_finished(id.as_str(), false, str_of(state, "error") ?? ""));
+    } else {
+      var ok = true;
+      if (let m = get(state, "metadata")) {
+        ok = (num_of(m, "exit") ?? 0.0) == 0.0;
+      }
+      out.push(tool_finished(id.as_str(), ok, str_of(state, "output") ?? ""));
+    }
+  } else if (kind == "error") {
+    t.failed = true;
+    var why = "opencode failed.";
+    if (let e = get(line, "error")) {
+      why = str_of(e, "name") ?? why;
+      if (let data = get(e, "data")) {
+        why = str_of(data, "message") ?? why;
+      }
+    }
+    out.push(said(t.next_id().as_str(), "error", why));
+  }
+  return out;
+}
+
+fn tool_detail<'a>(part: &'a Json): str<'a> {
+  if (let input = path(part, "state.input")) {
+    if (let command = str_of(input, "command")) {
+      return command;
+    }
+    if (let file = str_of(input, "filePath")) {
+      return file;
+    }
+  }
+  if (let state = get(part, "state")) {
+    return str_of(state, "title") ?? "";
+  }
+  return "";
+}

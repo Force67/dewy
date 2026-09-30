@@ -1,6 +1,6 @@
 // What a box tells the orchestrator about itself: its name and system,
-// the agents on its PATH, the git repositories below its project roots,
-// and load and memory from /proc.
+// the agents on its PATH and the models opencode offers, the git
+// repositories below its project roots, and load and memory from /proc.
 
 module worker::inventory;
 
@@ -15,6 +15,9 @@ import {split, split_whitespace, lines} from akibase::strings::string_util;
 import {trim, strip_prefix, trim_matches} from akibase::strings::string_search;
 import {parse_f64} from akibase::strings::string_to_number;
 import {sort} from akibase::algorithm;
+import {opencode_models} from worker::opencode;
+import {private_temp} from worker::turn;
+import {system_now} from akibase::time::time;
 
 pub fn hostname(): String {
   let name = read_file("/proc/sys/kernel/hostname") ?? from_str("box");
@@ -66,9 +69,21 @@ fn repositories(roots&: [String]): Json {
   return out;
 }
 
-pub fn hello(token: str, name: str, roots&: [String], running: Json): Json {
+// The models each agent offers. Listed before dialing, as the orchestrator
+// waits only ten seconds for the hello.
+pub fn models(): Json {
+  var out = object();
+  if (on_path("opencode")) {
+    var stem = from_str("dewy-models-");
+    stem.push_i64(system_now().unix_nanoseconds());
+    set(out, "opencode", opencode_models(join(private_temp().as_str(), stem.as_str()).as_str()));
+  }
+  return out;
+}
+
+pub fn hello(token: str, name: str, roots&: [String], models: Json, running: Json): Json {
   var agents = array();
-  for (let a in ["claude", "codex"]) {
+  for (let a in ["claude", "codex", "opencode"]) {
     if (on_path(a)) {
       push(agents, text(a));
     }
@@ -80,6 +95,7 @@ pub fn hello(token: str, name: str, roots&: [String], running: Json): Json {
   set(h, "host", text(hostname().as_str()));
   set(h, "os", text(os_name().as_str()));
   set(h, "agents", agents);
+  set(h, "models", models);
   set(h, "projects", repositories(roots));
   set(h, "running", running);
   return h;

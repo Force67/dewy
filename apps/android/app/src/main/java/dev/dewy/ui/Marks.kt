@@ -84,7 +84,7 @@ fun StatePill(state: TaskState, modifier: Modifier = Modifier) {
     }
 }
 
-/** The agent's mark: Claude in its clay, Codex in graphite. */
+/** The agent's mark: Claude in its clay, Codex in graphite, opencode in slate. */
 @Composable
 fun AgentMark(agent: String, modifier: Modifier = Modifier, size: Dp = 36.dp) {
     val p = LocalPalette.current
@@ -93,6 +93,7 @@ fun AgentMark(agent: String, modifier: Modifier = Modifier, size: Dp = 36.dp) {
         "codex" -> Brush.linearGradient(
             if (p.isDark) listOf(Color(0xFF3A4247), Color(0xFF22282B)) else listOf(Color(0xFF30373B), Color(0xFF111517)),
         ) to "◎"
+        "opencode" -> Brush.linearGradient(listOf(Color(0xFF5B6B8C), Color(0xFF34405A))) to "◇"
         else -> Brush.linearGradient(listOf(p.dew, p.dewDeep)) to agent.take(1).uppercase()
     }
     Box(modifier.size(size).clip(CircleShape).background(brush), contentAlignment = Alignment.Center) {
@@ -103,5 +104,6 @@ fun AgentMark(agent: String, modifier: Modifier = Modifier, size: Dp = 36.dp) {
 fun agentLabel(agent: String) = when (agent) {
     "claude" -> "Claude Code"
     "codex" -> "Codex"
+    "opencode" -> "opencode"
     else -> agent.replaceFirstChar { it.uppercase() }
 }

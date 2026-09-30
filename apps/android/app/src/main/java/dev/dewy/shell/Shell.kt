@@ -97,6 +97,7 @@ fun Shell(
 
     val seen = readMarks.seen.collectAsStateWithLifecycle(emptyMap())
     val yolo by settings.yolo.collectAsStateWithLifecycle(false)
+    val lastModel by settings.model.collectAsStateWithLifecycle("")
     val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
     val stack = rememberNavBackStack(Route.Folders, Route.Tasks(Folder.All))
@@ -139,8 +140,10 @@ fun Shell(
             draft = draft,
             yolo = yolo,
             onYolo = { on -> scope.launch { settings.setYolo(on) } },
-            onStart = { box, project, agent, text, images, yolo ->
-                store.startTask(box, project, agent, text, uploadImages(appContext, store, images), yolo)
+            lastModel = lastModel,
+            onModel = { m -> scope.launch { settings.setModel(m) } },
+            onStart = { box, project, agent, model, text, images, yolo ->
+                store.startTask(box, project, agent, model, text, uploadImages(appContext, store, images), yolo)
                     .also { discardStaged(images) }
             },
             onStarted = { task ->

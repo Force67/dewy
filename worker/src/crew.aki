@@ -82,7 +82,7 @@ fn Crew::order(var self&, msg&: Json): () {
   let o = TurnOrder {
     task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
     session: string_of(msg, "session"), text: string_of(msg, "text"), yolo: bool_of(msg, "yolo") ?? false,
-    images: turn_images(msg)
+    images: turn_images(msg), model: string_of(msg, "model")
   };
   if (self.is_running(task)) {
     self.waiting.push(o);

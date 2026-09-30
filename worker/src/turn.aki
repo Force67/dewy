@@ -24,19 +24,22 @@ import {Transcript} from worker::transcript;
 import {make_fifo} from worker::fifo;
 import {claude_command, claude_input, read_claude} from worker::claude_code;
 import {codex_command, read_codex} from worker::codex;
+import {opencode_command, read_opencode} from worker::opencode;
 import {find_session, end_session} from worker::terminal;
 
-pub enum Agent { Claude, Codex }
+pub enum Agent { Claude, Codex, OpenCode }
 
 pub fn agent_named(name: str): Agent? => match (name) {
   "claude" => Agent::Claude,
   "codex" => Agent::Codex,
+  "opencode" => Agent::OpenCode,
   _ => none,
 };
 
 pub fn agent_name(a: Agent): str<'static> => match (a) {
   Agent::Claude => "claude",
   Agent::Codex => "codex",
+  Agent::OpenCode => "opencode",
 };
 
 // A turn that ended, so the crew can start the next one for its task.
@@ -68,6 +71,8 @@ pub struct TurnOrder : Send {
   // The task asked to run without permission prompts.
   pub var yolo: bool
   pub var images: Vector<TurnImage>
+  // provider/model for opencode, empty for the agent's default.
+  pub var model: String
 }
 
 pub struct TurnJob : Send {
@@ -155,7 +160,7 @@ fn extension(media: str): str<'static> => match (media) {
 
 // Writes the turn's images where its agent takes them: Claude reads a
 // stream-json message on standard input, which becomes the first of the
-// returned paths; Codex gets files. Every file written lands in `inputs`.
+// returned paths; Codex and opencode get files. Every file written lands in `inputs`.
 // None when an image could not be written, rather than a turn without it.
 fn image_files(o&: TurnOrder, stem: str, var inputs&: Vector<String>): Vector<String>? {
   var paths = new::<String>();
@@ -201,7 +206,7 @@ extern("getuid") fn c_getuid(): u32;
 
 // A directory only this user can read, for a turn's output and the images
 // it hands the agent, which may be private screenshots.
-fn private_temp(): String {
+pub fn private_temp(): String {
   var name = from_str("dewy-worker-");
   var uid: u32 = 0;
   unsafe {
@@ -230,6 +235,7 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
   var cmd = match (o.agent) {
     Agent::Claude => claude_command(o.text.as_str(), o.session.as_str(), job.yolo, on_stdin),
     Agent::Codex => codex_command(o.text.as_str(), o.session.as_str(), job.yolo, images),
+    Agent::OpenCode => opencode_command(o.text.as_str(), o.session.as_str(), o.model.as_str(), job.yolo, images),
   };
   cmd.current_dir(o.project.as_str());
   cmd.stdin_from(on_stdin ? images[0].as_str() : "/dev/null");
@@ -254,6 +260,7 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
     let entries = match (o.agent) {
       Agent::Claude => read_claude(t, j),
       Agent::Codex => read_codex(t, j),
+      Agent::OpenCode => read_opencode(t, j),
     };
     if (!t.session.eq(session)) {
       session = t.session.clone();

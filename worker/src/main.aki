@@ -19,9 +19,9 @@ import {milliseconds, seconds, sleep, now} from akibase::time::time;
 import {eprintln, print} from akibase::logging;
 import {LineStream} from wire::line_stream;
 import {Crew} from worker::crew;
-import {hello, hostname, stats} from worker::inventory;
+import {hello, hostname, models, stats} from worker::inventory;
 import {terminal_sessions, sessions_message} from worker::terminal;
-import {to_string} from akibase::text::json;
+import {Json, to_string} from akibase::text::json;
 import {resolve_ipv4} from worker::resolve;
 
 fn parser(): OptionParser {
@@ -83,6 +83,7 @@ fn run(o&: Options): i32 {
   var crew = Crew(o.flag("yolo"));
   var pause = seconds(1);
   while (true) {
+    let listed = models();
     if (let ip = resolve_ipv4(host)) {
       let at = SocketAddress { ip, port: port as u16 };
       if (let stream = connect_to(at)) {
@@ -91,7 +92,7 @@ fn run(o&: Options): i32 {
         let _ = s.set_read_timeout(milliseconds(200));
         let _ = s.set_write_timeout(seconds(10));
         print(f"worker: {name} linked to {at.to_string()}\n".as_str());
-        serve(LineStream(s), crew, token.as_str(), name.as_str(), roots.as_slice());
+        serve(LineStream(s), crew, token.as_str(), name.as_str(), roots.as_slice(), listed);
         eprintln("worker: lost the orchestrator");
       }
     } else {
@@ -104,9 +105,9 @@ fn run(o&: Options): i32 {
 }
 
 // Relays until the link breaks.
-fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [String]): () {
+fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [String], models: Json): () {
   var l = link;
-  if (let _ = l.send(hello(token, name, roots, crew.running_tasks()))) {
+  if (let _ = l.send(hello(token, name, roots, models, crew.running_tasks()))) {
   } else {
     return;
   }

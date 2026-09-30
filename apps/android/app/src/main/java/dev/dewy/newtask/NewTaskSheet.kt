@@ -25,6 +25,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -48,6 +49,8 @@ import dev.dewy.images.AttachButton
 import dev.dewy.images.AttachmentRow
 import dev.dewy.images.discardStaged
 import dev.dewy.images.MaxImages
+import dev.dewy.models.ModelPicker
+import dev.dewy.models.modelLabel
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -79,7 +82,9 @@ fun NewTaskSheet(
     draft: Draft,
     yolo: Boolean,
     onYolo: (Boolean) -> Unit,
-    onStart: suspend (box: String, project: String, agent: String, text: String, images: List<Uri>, yolo: Boolean) -> Task,
+    lastModel: String,
+    onModel: (String) -> Unit,
+    onStart: suspend (box: String, project: String, agent: String, model: String, text: String, images: List<Uri>, yolo: Boolean) -> Task,
     onStarted: (Task) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -90,6 +95,9 @@ fun NewTaskSheet(
     var boxName by rememberSaveable { mutableStateOf(draft.box ?: online.firstOrNull()?.name) }
     val box = online.find { it.name == boxName }
     var agent by rememberSaveable(boxName) { mutableStateOf(box?.agents?.firstOrNull()) }
+    val models = box?.models?.get(agent).orEmpty()
+    var model by rememberSaveable(boxName, agent, lastModel, models) { mutableStateOf(lastModel.takeIf { it in models } ?: "") }
+    var picking by remember { mutableStateOf(false) }
     var project by rememberSaveable(boxName) { mutableStateOf(draft.project.takeIf { draft.box == boxName }) }
     var query by rememberSaveable { mutableStateOf("") }
     var text by rememberSaveable { mutableStateOf("") }
@@ -117,7 +125,7 @@ fun NewTaskSheet(
 
             if (box != null && box.agents.size > 1) {
                 Label("Agent")
-                Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     box.agents.forEach { a ->
                         Row(
                             Modifier
@@ -133,6 +141,42 @@ fun NewTaskSheet(
                             Text(agentLabel(a), style = Type.subhead, color = if (a == agent) p.dewDeep else p.ink)
                         }
                     }
+                }
+            }
+
+            if (models.isNotEmpty()) {
+                Label("Model")
+                Row(
+                    Modifier
+                        .padding(horizontal = 16.dp)
+                        .fillMaxWidth()
+                        .clip(CardShape)
+                        .background(p.surface)
+                        .clickable { picking = true }
+                        .padding(start = 14.dp, end = 10.dp, top = 11.dp, bottom = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(modelLabel(model), style = Type.body, color = p.ink)
+                        Text(
+                            if (model.isEmpty()) "Whatever opencode is set to use" else model.substringBefore('/'),
+                            style = Type.caption,
+                            color = p.inkFaint,
+                        )
+                    }
+                    Icon(Icons.Rounded.ChevronRight, "Pick a model", tint = p.inkFaint)
+                }
+                if (picking) {
+                    ModelPicker(
+                        models,
+                        model,
+                        onPick = {
+                            model = it
+                            onModel(it)
+                            picking = false
+                        },
+                        onDismiss = { picking = false },
+                    )
                 }
             }
 
@@ -229,7 +273,7 @@ fun NewTaskSheet(
                     problem = null
                     scope.launch {
                         try {
-                            val task = onStart(box!!.name, project!!, agent!!, text.trim(), images, yolo)
+                            val task = onStart(box!!.name, project!!, agent!!, model, text.trim(), images, yolo)
                             sheet.hide()
                             onStarted(task)
                         } catch (e: Exception) {

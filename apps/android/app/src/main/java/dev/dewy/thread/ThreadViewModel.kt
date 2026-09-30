@@ -32,6 +32,11 @@ class ThreadViewModel(
     val task: StateFlow<Task?> = store.board.map { b -> b.tasks.find { it.id == taskId } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, store.board.value.tasks.find { it.id == taskId })
 
+    /** The models the task's agent offers on its box; empty when it lists none. */
+    val models: StateFlow<List<String>> = store.board.map { b ->
+        b.tasks.find { it.id == taskId }?.let { t -> b.boxes.find { it.name == t.box }?.models?.get(t.agent) }.orEmpty()
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     val entries: StateFlow<List<Entry>?> = store.thread(taskId)
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
@@ -87,6 +92,8 @@ class ThreadViewModel(
     fun stop() = attempt { store.stop(taskId) }
 
     fun archive(archived: Boolean) = attempt { store.archive(taskId, archived) }
+
+    fun setModel(model: String) = attempt { store.setModel(taskId, model) }
 
     private fun attempt(action: suspend () -> Unit) = viewModelScope.launch {
         try {

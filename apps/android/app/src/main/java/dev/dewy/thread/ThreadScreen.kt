@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBackIos
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
@@ -58,6 +59,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.dewy.alerts.Alerts
+import dev.dewy.models.ModelPicker
+import dev.dewy.models.modelLabel
 import dev.dewy.net.Task
 import dev.dewy.net.TaskState
 import dev.dewy.ui.AgentMark
@@ -80,6 +83,8 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
     val entries by model.entries.collectAsStateWithLifecycle()
     val attachments by model.attachments.collectAsStateWithLifecycle()
     val sending by model.sending.collectAsStateWithLifecycle()
+    val models by model.models.collectAsStateWithLifecycle()
+    var picking by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     var draft by rememberSaveable { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
@@ -190,7 +195,7 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 8.dp),
         ) {
-            item(key = "header") { Header(t) }
+            item(key = "header") { Header(t, pickable = models.isNotEmpty(), onPickModel = { picking = true }) }
             items(items, key = { it.key }) { item ->
                 when (item) {
                     is Item.Said -> SaidView(item.entry)
@@ -204,10 +209,21 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
             }
         }
     }
+    if (picking && t != null) {
+        ModelPicker(
+            models,
+            t.model,
+            onPick = {
+                model.setModel(it)
+                picking = false
+            },
+            onDismiss = { picking = false },
+        )
+    }
 }
 
 @Composable
-private fun Header(t: Task) {
+private fun Header(t: Task, pickable: Boolean, onPickModel: () -> Unit) {
     val p = LocalPalette.current
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp),
@@ -227,6 +243,17 @@ private fun Header(t: Task) {
                     modifier = Modifier.clip(RoundedCornerShape(50)).background(p.coral.copy(alpha = 0.13f))
                         .padding(horizontal = 9.dp, vertical = 4.dp),
                 )
+            }
+            if (pickable || t.model.isNotEmpty()) {
+                Row(
+                    Modifier.clip(RoundedCornerShape(50)).background(p.dewWash)
+                        .clickable(enabled = pickable, onClick = onPickModel)
+                        .padding(start = 9.dp, end = if (pickable) 5.dp else 9.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(modelLabel(t.model), style = Type.caption, color = p.dewDeep)
+                    if (pickable) Icon(Icons.Rounded.ExpandMore, "Change the model", tint = p.dewDeep, modifier = Modifier.size(14.dp))
+                }
             }
         }
         Spacer(Modifier.height(4.dp))

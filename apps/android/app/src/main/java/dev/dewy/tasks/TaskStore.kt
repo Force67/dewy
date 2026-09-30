@@ -160,8 +160,16 @@ class TaskStore(connection: Flow<Connection?>, private val cache: DewyCache, pri
         threads.value.keys.forEach { id -> scope.launch { runCatching { download(id) } } }
     }
 
-    suspend fun startTask(box: String, project: String, agent: String, text: String, images: List<String>, yolo: Boolean): Task {
-        val task = requireClient().startTask(box, project, agent, text, images, yolo)
+    suspend fun startTask(
+        box: String,
+        project: String,
+        agent: String,
+        model: String,
+        text: String,
+        images: List<String>,
+        yolo: Boolean,
+    ): Task {
+        val task = requireClient().startTask(box, project, agent, model, text, images, yolo)
         upsert(task)
         return task
     }
@@ -179,6 +187,11 @@ class TaskStore(connection: Flow<Connection?>, private val cache: DewyCache, pri
     suspend fun imageBytes(id: String): ByteArray = requireClient().image(id)
 
     suspend fun stop(id: String) = requireClient().stop(id)
+
+    suspend fun setModel(id: String, model: String) {
+        requireClient().setModel(id, model)
+        _board.update { b -> b.copy(tasks = b.tasks.map { if (it.id == id) it.copy(model = model) else it }) }
+    }
 
     suspend fun archive(id: String, archived: Boolean) {
         _board.update { b -> b.copy(tasks = b.tasks.map { if (it.id == id) it.copy(archived = archived) else it }) }

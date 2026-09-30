@@ -44,6 +44,8 @@ data class Task(
     val archived: Boolean = false,
     /** Its turns run without permission prompts. */
     val yolo: Boolean = false,
+    /** opencode's provider/model; empty for the agent's default. */
+    val model: String = "",
     val created: Long,
     val updated: Long,
     val turns: Int = 0,
@@ -72,6 +74,8 @@ data class Box(
     val lastSeen: Long = 0,
     val agents: List<String> = emptyList(),
     val projects: List<Project> = emptyList(),
+    /** The models each agent offers, where the box lists them. */
+    val models: Map<String, List<String>> = emptyMap(),
     val stats: BoxStats = BoxStats(),
     val sessions: List<TerminalSession> = emptyList(),
 )

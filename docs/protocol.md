@@ -7,14 +7,14 @@ A worker opens a TCP connection to the orchestrator's worker port and both sides
 The worker first sends its hello. `running` lists the tasks it still runs, so the orchestrator can fail tasks whose turn died with an earlier worker:
 
 ```json
-{"type":"hello","token":"…","box":"forge","host":"forge","os":"NixOS 26.11","agents":["claude","codex"],
- "projects":[{"name":"dewy","path":"/home/me/Projects/dewy"}],"running":[]}
+{"type":"hello","token":"…","box":"forge","host":"forge","os":"NixOS 26.11","agents":["claude","codex","opencode"],
+ "models":{"opencode":["opencode/big-pickle","opencode-go/kimi-k3"]},"projects":[{"name":"dewy","path":"/home/me/Projects/dewy"}],"running":[]}
 ```
 
-The orchestrator sends turns, stops, and watches. A turn for a task that is busy waits on the worker until the running turn ends. `yolo` runs the turn without permission prompts. `watch` follows a Claude Code session running in a terminal (see `docs/adr/0001-attach-terminal-sessions.md`).
+The orchestrator sends turns, stops, and watches. A turn for a task that is busy waits on the worker until the running turn ends. `yolo` runs the turn without permission prompts. `model` is opencode's `provider/model`, empty for its default (see `docs/adr/0004-opencode.md`). `watch` follows a Claude Code session running in a terminal (see `docs/adr/0001-attach-terminal-sessions.md`).
 
 ```json
-{"type":"turn","task":"7","turn":"t3","agent":"claude","project":"/home/me/Projects/dewy","session":"…","text":"now push it","yolo":false}
+{"type":"turn","task":"7","turn":"t3","agent":"claude","project":"/home/me/Projects/dewy","session":"…","text":"now push it","yolo":false,"model":""}
 {"type":"stop","task":"7"}
 {"type":"watch","task":"8","session":"d0806beb-…"}
 ```
