@@ -40,7 +40,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +52,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.dewy.alerts.Alerts
 import dev.dewy.net.Task
@@ -80,10 +80,10 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
     var menu by remember { mutableStateOf(false) }
 
     LaunchedEffect(model) { model.problems.collect { snackbar.showSnackbar(it) } }
-    DisposableEffect(task?.id) {
+    LifecycleStartEffect(task?.id) {
         alerts.openThread.value = task?.id
         task?.id?.let(alerts::dismiss)
-        onDispose { alerts.openThread.value = null }
+        onStopOrDispose { alerts.openThread.value = null }
     }
 
     val t = task
