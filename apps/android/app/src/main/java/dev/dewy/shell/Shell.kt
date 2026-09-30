@@ -24,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
@@ -80,7 +81,8 @@ fun Shell(
     alerts: Alerts,
     openRequests: Flow<String>,
 ) {
-    val board by store.board.collectAsStateWithLifecycle()
+    val boardState = store.board.collectAsStateWithLifecycle()
+    val board by boardState
     if (board.link == Link.NotSetUp) {
         ConnectScreen { url, token ->
             DewyClient(url, token).state()
@@ -90,7 +92,7 @@ fun Shell(
     }
     AskForNotifications()
 
-    val seen by readMarks.seen.collectAsStateWithLifecycle(emptyMap())
+    val seen = readMarks.seen.collectAsStateWithLifecycle(emptyMap())
     val scope = rememberCoroutineScope()
     val stack = rememberNavBackStack(Route.Folders, Route.Tasks(Folder.All))
     var composing by rememberSaveable { mutableStateOf(false) }
@@ -104,8 +106,8 @@ fun Shell(
     LaunchedEffect(Unit) { openRequests.collect { openDetail(Route.Thread(it)) } }
 
     val screens = Screens(
-        board = board,
-        seen = seen,
+        boardState = boardState,
+        seenState = seen,
         stack = stack,
         store = store,
         settings = settings,
@@ -137,10 +139,14 @@ fun Shell(
     }
 }
 
-/** Everything a route needs to draw itself, in one place for both layouts. */
+/**
+ * Everything a route needs to draw itself, in one place for both layouts.
+ * NavDisplay keeps each entry's content from its first composition, so the
+ * board and read marks are read through State to stay current.
+ */
 private class Screens(
-    val board: Board,
-    val seen: Map<String, Long>,
+    private val boardState: State<Board>,
+    private val seenState: State<Map<String, Long>>,
     val stack: NavBackStack<NavKey>,
     val store: TaskStore,
     val settings: ConnectionSettings,
@@ -150,6 +156,8 @@ private class Screens(
     val compose: (Draft) -> Unit,
     val archive: (Task, Boolean) -> Unit,
 ) {
+    val board: Board get() = boardState.value
+    val seen: Map<String, Long> get() = seenState.value
     val folder: Folder get() = stack.filterIsInstance<Route.Tasks>().lastOrNull()?.folder ?: Folder.All
     val selectedTask: String? get() = (stack.lastOrNull() as? Route.Thread)?.taskId
 
