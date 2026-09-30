@@ -25,4 +25,3 @@ What dewy needed from aki and akibase that was missing or surprising, and how it
 - **`a ?? b == c` parses as `a ?? (b == c)`.** Write `(a ?? b) == c`.
 - **Fields and methods share one namespace**, so a struct cannot have a field `seq` and a method `seq()`.
 - **Free functions in a struct's own module cannot build it or touch private fields**; they go through a constructor or a method.
-- **Indexing a temporary `Vector` frees it twice.** `f()[0].as_str()` aborts with a double free at runtime; bind the vector to a local first.
