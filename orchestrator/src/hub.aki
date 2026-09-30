@@ -1,5 +1,6 @@
 // What every connection shares: the board behind its lock, a signal that
-// fires after each change, and the token clients must present.
+// fires after each change, the token clients must present, and the epoch,
+// which changes with every start, since the feed's seq starts over.
 
 module orchestrator::hub;
 
@@ -13,6 +14,7 @@ pub struct Hub : Send {
   pub let board: Mutex<Board>
   pub let changed: Condvar
   pub let token: String
+  pub let epoch: i64
 }
 
 pub fn now_ms(): i64 => unix_time_milliseconds();

@@ -86,7 +86,7 @@ fn run(o&: Options, token: String): i32 {
   };
   print(f"orchestrator: {restored} tasks from {data}, app on {app.local_address()!.to_string()}, workers on {docks.local_address()!.to_string()}\n".as_str());
 
-  let hub = make_shared(Hub { board: Mutex::<Board>(board), changed: Condvar(), token });
+  let hub = make_shared(Hub { board: Mutex::<Board>(board), changed: Condvar(), token, epoch: now_ms() });
   let keeper = spawn(keep_time, (hub.share(), data));
   let dock = spawn(accept_workers, (docks, hub.share()));
   let pool = ThreadPool(kAppThreads);

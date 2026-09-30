@@ -9,19 +9,21 @@
 //   POST /api/tasks/<id>/stop
 //   POST /api/tasks/<id>/archive      {archived}
 //   POST /api/sessions/attach         {box, session, yolo}: follow a terminal session as a task
-//   GET  /api/stream?since=<seq>      changes after seq as server-sent events
+//   GET  /api/stream?since=<seq>&epoch=<epoch>
+//                                     changes after seq as server-sent events
 
 module orchestrator::api;
 
 import {String} from akibase::strings::base_string;
 import {TcpStream} from akibase::net::tcp;
-import {Request, finish, kMaxHead, path_part, read_error_status, read_request, send_response, error_body}
+import {Request, finish, header, kMaxHead, path_part, read_error_status, read_request, send_response, error_body}
   from akibase::net::http;
+import {gzip} from orchestrator::gzip;
 import {SharedPointer} from akibase::memory::shared_pointer;
-import {Json, object, set, text, boolean, parse, to_string} from akibase::text::json;
+import {Json, object, set, text, number, boolean, parse, to_string} from akibase::text::json;
 import {utf8_lossy} from akibase::text::code_convert;
 import {split} from akibase::strings::string_util;
-import {find, strip_prefix} from akibase::strings::string_search;
+import {contains, find, strip_prefix} from akibase::strings::string_search;
 import {parse_u64} from akibase::strings::string_to_number;
 import {seconds} from akibase::time::time;
 import {str_of, bool_of} from wire::fields;
@@ -30,6 +32,7 @@ import {Hub, now_ms} from orchestrator::hub;
 import {stream_changes} from orchestrator::stream;
 
 comptime let kMaxBody: usize = 1 << 20;
+comptime let kGzipFrom: usize = 1024;
 
 pub struct AppConnection : Send {
   pub var stream: TcpStream
@@ -82,18 +85,31 @@ pub fn serve_app(c: AppConnection): () {
   };
   let path = path_part(r.target.as_str());
   if (path != "/api/health" && !authorized(r, hub.token.as_str())) {
-    send(stream, error_reply(401, "missing or wrong token"));
+    send(stream, error_reply(401, "missing or wrong token"), false);
     return;
   }
   if (r.method.eq_str("GET") && path == "/api/stream") {
-    stream_changes(stream, hub, since(r.target.as_str()));
+    // A client from before this start, which names no epoch or an old one,
+    // resumes from a seq that means something else now.
+    let epoch = query_u64(r.target.as_str(), "epoch=");
+    let current = epoch == 0 || epoch == hub.epoch as u64;
+    stream_changes(stream, hub, query_u64(r.target.as_str(), "since="), current);
     return;
   }
   let reply = route(r, path, hub);
-  send(stream, reply);
+  send(stream, reply, contains(r.header("Accept-Encoding") ?? "", "gzip"));
 }
 
-fn send(var stream&: TcpStream, reply: Reply): () {
+fn send(var stream&: TcpStream, reply: Reply, gz: bool): () {
+  // Threads are long and repetitive, so gzip shrinks them several times over.
+  if (gz && reply.body.len() >= kGzipFrom) {
+    if (let packed = gzip(reply.body.as_bytes())) {
+      let extra = [header("Content-Encoding", "gzip")];
+      let _ = send_response(stream, reply.status, "application/json", packed.as_slice(), extra, true);
+      finish(stream);
+      return;
+    }
+  }
   let _ = send_response(stream, reply.status, "application/json", reply.body.as_bytes(), [], true);
   finish(stream);
 }
@@ -112,11 +128,15 @@ fn authorized(r&: Request, token: str): bool {
   return diff == 0;
 }
 
-fn since(target: str): u64 {
-  let at = find(target, "since=") else {
+fn query_u64(target: str, key: str): u64 {
+  let at = find(target, key) else {
     return 0;
   };
-  return parse_u64(target[at + 6..]) ?? 0;
+  var value = target[at + #key..];
+  if (let end = find(value, "&")) {
+    value = value[..end];
+  }
+  return parse_u64(value) ?? 0;
 }
 
 fn body_json(r&: Request): Json? => parse(utf8_lossy(r.body.as_slice()).as_str());
@@ -131,7 +151,8 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
     return ok_reply();
   }
   if (get && path == "/api/state") {
-    let j = hub.board.with(fn(b: &var Board): Json => b.state_json());
+    var j = hub.board.with(fn(b: &var Board): Json => b.state_json());
+    set(j, "epoch", number(hub.epoch as f64));
     return json_reply(200, j);
   }
   if (post && path == "/api/tasks") {
@@ -145,7 +166,15 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
   }
   let id = parts[3];
   if (get && n == 4) {
-    let found = hub.board.with(fn(b: &var Board): Json? => b.task_json(id));
+    // The feed position the thread was read at, so a client can tell which
+    // streamed changes it already holds.
+    let found = hub.board.with(fn(b: &var Board): Json? {
+      var j = b.task_json(id) else {
+        return none;
+      };
+      set(j, "seq", number(b.last_seq() as f64));
+      return j;
+    });
     if (let j = found) {
       return json_reply(200, j);
     }

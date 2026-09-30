@@ -88,7 +88,7 @@ data class TerminalSession(
 }
 
 @Serializable
-data class BoardState(val seq: Long, val boxes: List<Box>, val tasks: List<Task>)
+data class BoardState(val seq: Long, val boxes: List<Box>, val tasks: List<Task>, val epoch: Long = 0)
 
 /**
  * One line of a task's thread. The server merges updates by id, so a tool
@@ -129,9 +129,14 @@ enum class EntryKind {
 data class TaskThread(
     val id: String,
     val entries: List<Entry> = emptyList(),
+    /** The feed position the thread was read at. */
+    val seq: Long = 0,
 )
 
 /** A change the server streams: an updated task or box, or a thread entry. */
+/** An event and its position in the orchestrator's feed; a reset has none. */
+class StreamEvent(val seq: Long?, val event: ServerEvent)
+
 sealed interface ServerEvent {
     data class TaskChanged(val task: Task) : ServerEvent
     data class BoxChanged(val box: Box) : ServerEvent

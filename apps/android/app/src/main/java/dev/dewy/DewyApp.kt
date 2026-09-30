@@ -7,6 +7,8 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import dev.dewy.alerts.Alerts
 import dev.dewy.alerts.WatchService
 import dev.dewy.settings.ConnectionSettings
+import dev.dewy.tasks.DewyCache
+import dev.dewy.tasks.Link
 import dev.dewy.tasks.ReadMarks
 import dev.dewy.tasks.TaskStore
 import kotlinx.coroutines.CoroutineScope
@@ -15,6 +17,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
@@ -34,9 +37,10 @@ class DewyApp : Application() {
         super.onCreate()
         settings = ConnectionSettings(this)
         readMarks = ReadMarks(this)
-        store = TaskStore(settings.connection, scope)
+        store = TaskStore(settings.connection, DewyCache(this), scope)
         alerts = Alerts(this)
-        alerts.watch(store.board.map { it.tasks }, settings.notify, scope)
+        // Only live boards count: the cached one at start is not news.
+        alerts.watch(store.board.filter { it.link == Link.Live }.map { it.tasks }, settings.notify, scope)
 
         val visible = MutableStateFlow(false)
         ProcessLifecycleOwner.get().lifecycle.addObserver(object : DefaultLifecycleObserver {

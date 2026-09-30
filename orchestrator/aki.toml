@@ -9,3 +9,4 @@ wire = { path = "../wire" }
 
 [build]
 opt = 2
+link = ["-lz"]

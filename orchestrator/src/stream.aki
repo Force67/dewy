@@ -1,6 +1,7 @@
 // Server-sent events for the app: every board change after the client's
 // position, as it happens. When the feed no longer reaches back that far,
-// a `reset` event tells the client to reload /api/state.
+// or the position is from an earlier start, a `reset` event tells the
+// client to reload /api/state.
 
 module orchestrator::stream;
 
@@ -18,12 +19,16 @@ struct Batch {
   pub var seq: u64
 }
 
-pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64): () {
+pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64, current: bool): () {
   if (let _ = stream.write_all(from_str(kHead).as_bytes())) {
   } else {
     return;
   }
   var seq = since;
+  if (!current) {
+    // No frame can match; the first batch resets.
+    seq = 0xffff_ffff_ffff_ffff;
+  }
   var last_write = now();
   while (true) {
     let seen = hub.changed.current();

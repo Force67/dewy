@@ -1,0 +1,68 @@
+// The gzip wrapper: header and trailer, and deflate data that zlib inflates
+// back to the input once rewrapped as a zlib stream.
+
+module gzip_test;
+
+import {Vector, new, resize} from akibase::containers::vector;
+import {String} from akibase::strings::base_string;
+import {eprintln} from akibase::logging;
+import {crc32} from akibase::hashing::crc;
+import {gzip} from orchestrator::gzip;
+
+extern("uncompress") fn c_uncompress(dest: *var u8, dest_len: *var u64, src: *const u8, src_len: u64): i32;
+extern("adler32") fn c_adler32(adler: u64, buf: *const u8, len: u32): u64;
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+fn le32(g&: Vector<u8>, at: usize): u32 =>
+  (g[at] as u32) | ((g[at + 1] as u32) << 8) | ((g[at + 2] as u32) << 16) | ((g[at + 3] as u32) << 24);
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  var text = String();
+  for (let _ in 0..500) {
+    text.push_str("{\"id\":\"t1.m1\",\"kind\":\"agent\",\"text\":\"a thread repeats itself\"}");
+  }
+  let data = text.as_bytes();
+  let g = gzip(data)!;
+  let n = g.len();
+  check(n < #data / 4, "gzip shrinks repetitive JSON", failures);
+  check(g[0] == 0x1f && g[1] == 0x8b && g[2] == 8, "a gzip header", failures);
+  check(le32(g, n - 8) == crc32(data), "the trailer holds the CRC-32", failures);
+  check(le32(g, n - 4) == #data as u32, "the trailer holds the length", failures);
+
+  var z = new::<u8>();
+  z.push(0x78);
+  z.push(0x9c);
+  for (let i in 10usize..(n - 8)) {
+    z.push(g[i]);
+  }
+  var adler: u64 = 0;
+  unsafe {
+    adler = c_adler32(1, @ptr(data), #data as u32);
+  }
+  for (let shift in [24u64, 16, 8, 0]) {
+    z.push(((adler >> shift) & 0xff) as u8);
+  }
+  var back = new::<u8>();
+  resize(back, #data + 16, 0u8);
+  var len = back.len() as u64;
+  var rc: i32 = -1;
+  unsafe {
+    rc = c_uncompress(@ptr(back.as_slice_var()), &raw var len, @ptr(z.as_slice()), z.len() as u64);
+  }
+  check(rc == 0 && len == #data as u64, "zlib inflates the deflate data", failures);
+  var same = rc == 0;
+  for (let i in 0usize..#data) {
+    if (same && back[i] != data[i]) {
+      same = false;
+    }
+  }
+  check(same, "to the input", failures);
+  return failures;
+}

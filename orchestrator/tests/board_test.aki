@@ -106,6 +106,10 @@ pub fn main(): i32 {
   check(later.len() == 1 && contains(later[0].as_str(), "\"yolo\":true"), "and so does every later turn", failures);
   check(contains(to_string(b.task_json(wild.as_str())!).as_str(), "\"yolo\":true"), "the task shows it", failures);
 
+  let newest = b.last_seq();
+  check(b.frames_since(newest)!.len() == 0, "nothing after the newest change", failures);
+  check(b.frames_since(newest + 5) == none, "a position past the newest resets", failures);
+
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);
   return failures;

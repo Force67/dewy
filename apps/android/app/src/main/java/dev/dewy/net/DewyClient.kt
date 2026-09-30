@@ -72,11 +72,15 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
     suspend fun archive(id: String, archived: Boolean) =
         post("api/tasks/$id/archive", buildJsonObject { put("archived", JsonPrimitive(archived)) }.toString())
 
-    /** Every change after [since], until the connection drops or the collector stops. */
-    fun events(since: Long): Flow<ServerEvent> = callbackFlow {
+    /**
+     * Every change after [since] in the orchestrator start [epoch], until the
+     * connection drops or the collector stops. A position from another start
+     * gets a reset.
+     */
+    fun events(since: Long, epoch: Long): Flow<StreamEvent> = callbackFlow {
         val listener = object : EventSourceListener() {
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
-                runCatching { ServerEvent.parse(type, data) }.getOrNull()?.let { trySend(it) }
+                runCatching { ServerEvent.parse(type, data) }.getOrNull()?.let { trySend(StreamEvent(id?.toLongOrNull(), it)) }
             }
 
             override fun onClosed(eventSource: EventSource) {
@@ -88,7 +92,7 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
             }
         }
         val source = EventSources.createFactory(streamHttp)
-            .newEventSource(request("api/stream?since=$since").get().build(), listener)
+            .newEventSource(request("api/stream?since=$since&epoch=$epoch").get().build(), listener)
         awaitClose { source.cancel() }
     }
 

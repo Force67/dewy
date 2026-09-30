@@ -505,6 +505,10 @@ fn Board::take_outbox(var self&, box_name: str): Vector<String> {
 // that far and the client must reload the state.
 fn Board::frames_since(self&, seq: u64): Vector<String>? {
   var out = new::<String>();
+  // A position past the newest change comes from before a restart.
+  if (seq > self.seq) {
+    return none;
+  }
   if (let first = self.feed.front()) {
     if (first.seq > seq + 1) {
       return none;
