@@ -208,6 +208,7 @@ private fun StatusBar(tasks: List<Task>, link: Link, onCompose: () -> Unit) {
                 else -> when {
                     working > 0 -> "$working working"
                     tasks.isEmpty() -> ""
+                    tasks.size == 1 -> "1 task"
                     else -> "${tasks.size} tasks"
                 }
             }

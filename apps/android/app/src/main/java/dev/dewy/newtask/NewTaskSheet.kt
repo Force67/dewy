@@ -45,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.dewy.net.Box as DewyBox
 import dev.dewy.net.Task
@@ -127,7 +128,7 @@ fun NewTaskSheet(
                     Spacer(Modifier.size(8.dp))
                     Box(Modifier.weight(1f)) {
                         if (query.isEmpty()) Text("Search ${box?.projects?.size ?: 0} projects", style = Type.callout, color = p.inkFaint)
-                        BasicTextField(query, { query = it }, singleLine = true, textStyle = Type.callout.copy(color = p.ink), cursorBrush = SolidColor(p.dew))
+                        BasicTextField(query, { query = it }, Modifier.fillMaxWidth(), singleLine = true, textStyle = Type.callout.copy(color = p.ink), cursorBrush = SolidColor(p.dew))
                     }
                 }
                 Hairline(0.dp)
@@ -140,7 +141,7 @@ fun NewTaskSheet(
                         ) {
                             Column(Modifier.weight(1f)) {
                                 Text(proj.name, style = Type.body, color = p.ink)
-                                Text(proj.path, style = Type.caption, color = p.inkFaint, maxLines = 1)
+                                Text(proj.path, style = Type.caption, color = p.inkFaint, maxLines = 1, overflow = TextOverflow.StartEllipsis)
                             }
                             if (proj.path == project) Icon(Icons.Rounded.Check, "Chosen", tint = p.dew)
                         }
