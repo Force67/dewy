@@ -2,7 +2,7 @@ module board_test;
 
 import {String} from akibase::strings::base_string;
 import {contains} from akibase::strings::string_search;
-import {parse, to_string} from akibase::text::json;
+import {parse, to_string, array} from akibase::text::json;
 import {eprintln} from akibase::logging;
 import {str_of} from wire::fields;
 import {Board, Refusal, kStallMillis} from orchestrator::board;
@@ -24,19 +24,20 @@ fn task_state(b&: Board, id: str): String {
 pub fn main(): i32 {
   var failures: i32 = 0;
   var b = Board();
+  let none_images = array();
   let hello = parse("{\"type\":\"hello\",\"box\":\"forge\",\"host\":\"forge.lan\",\"agents\":[\"claude\"],\"projects\":[],\"running\":[]}")!;
 
-  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", false, 1000)) {
+  if (let _ = b.create_task("forge", "/src/dewy", "claude", "fix it", none_images, false, 1000)) {
     check(false, "an unknown box takes no task", failures);
   } else (let e) {
     check(e == Refusal::NoSuchBox, "unknown box", failures);
   }
 
   let _ = b.attach(hello, 1000);
-  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", false, 1000)) {
+  if (let _ = b.create_task("forge", "/src/dewy", "codex", "fix it", none_images, false, 1000)) {
     check(false, "an agent the box lacks is refused", failures);
   }
-  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", false, 1000)!;
+  let id = b.create_task("forge", "/src/dewy", "claude", "fix the flaky test\nthen push", none_images, false, 1000)!;
   check(id.as_str() == "1", "ids count up", failures);
 
   let out = b.take_outbox("forge");
@@ -67,7 +68,7 @@ pub fn main(): i32 {
   check(task_state(b, "1").as_str() == "idle", "a finished turn idles", failures);
 
   let seq = b.last_seq();
-  let _ = b.steer("1", "now push", 600000);
+  let _ = b.steer("1", "now push", none_images, 600000);
   let frames = b.frames_since(seq)!;
   check(frames.len() >= 2, "steering emits the entry and the task", failures);
 
@@ -98,10 +99,10 @@ pub fn main(): i32 {
   check(contains(to_string(b.task_json(watched.as_str())!).as_str(), "\"title\":\"Rust port\""), "the worker names the task", failures);
 
   let _ = b.take_outbox("forge");
-  let wild = b.create_task("forge", "/src/dewy", "claude", "go", true, 850000)!;
+  let wild = b.create_task("forge", "/src/dewy", "claude", "go", none_images, true, 850000)!;
   let turns = b.take_outbox("forge");
   check(turns.len() == 1 && contains(turns[0].as_str(), "\"yolo\":true"), "a yolo task's turn says so", failures);
-  let _ = b.steer(wild.as_str(), "again", 850001);
+  let _ = b.steer(wild.as_str(), "again", none_images, 850001);
   let later = b.take_outbox("forge");
   check(later.len() == 1 && contains(later[0].as_str(), "\"yolo\":true"), "and so does every later turn", failures);
   check(contains(to_string(b.task_json(wild.as_str())!).as_str(), "\"yolo\":true"), "the task shows it", failures);
@@ -109,6 +110,17 @@ pub fn main(): i32 {
   let newest = b.last_seq();
   check(b.frames_since(newest)!.len() == 0, "nothing after the newest change", failures);
   check(b.frames_since(newest + 5) == none, "a position past the newest resets", failures);
+
+  // Images: the thread keeps their ids, the worker's turn gets their data.
+  let _ = b.take_outbox("forge");
+  let pictures = parse("[{\"id\":\"ab12\",\"type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}]")!;
+  let shot = b.create_task("forge", "/src/dewy", "claude", "", pictures, false, 860000)!;
+  let shown = to_string(b.task_json(shot.as_str())!);
+  check(contains(shown.as_str(), "\"title\":\"Image\""), "an image alone is a task named Image", failures);
+  check(contains(shown.as_str(), "\"images\":[{\"id\":\"ab12\",\"type\":\"image/png\"}]"), "the thread keeps the ids", failures);
+  check(!contains(shown.as_str(), "iVBOR"), "and not the data", failures);
+  let sent = b.take_outbox("forge");
+  check(sent.len() == 1 && contains(sent[0].as_str(), "\"data\":\"iVBORw0KGgo=\""), "the turn carries the data", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

@@ -107,9 +107,10 @@ pub struct Board : Send {
 
   pub fn Board(): Board;
   pub fn last_seq(self&): u64;
-  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, yolo: bool, now: i64): String ! Refusal;
+  pub fn create_task(var self&, box_name: str, project: str, agent: str, prompt: str, images&: Json, yolo: bool, now: i64)
+    : String ! Refusal;
   pub fn attach_session(var self&, box_name: str, session: str, yolo: bool, now: i64): String ! Refusal;
-  pub fn steer(var self&, id: str, prompt: str, now: i64): () ! Refusal;
+  pub fn steer(var self&, id: str, prompt: str, images&: Json, now: i64): () ! Refusal;
   pub fn stop(var self&, id: str, now: i64): () ! Refusal;
   pub fn archive(var self&, id: str, archived: bool, now: i64): () ! Refusal;
   pub fn attach(var self&, hello&: Json, now: i64): String;
@@ -127,7 +128,7 @@ pub struct Board : Send {
   pub fn restore_box(var self&, j&: Json): ();
   fn find_task(self&, id: str): usize?;
   fn find_box(self&, name: str): usize?;
-  fn send_turn(var self&, i: usize, prompt: str, now: i64): ();
+  fn send_turn(var self&, i: usize, prompt: str, images&: Json, now: i64): ();
   fn put_entry(var self&, i: usize, entry: Json, now: i64): ();
   fn set_state(var self&, i: usize, state: TaskState, now: i64): ();
   fn emit(var self&, kind: str, data&: Json): ();
@@ -181,7 +182,8 @@ fn listed(obj&: Json, key: str, value: str): bool {
   return has_text(list, value);
 }
 
-fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, yolo: bool, now: i64): String ! Refusal {
+fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt: str, images&: Json, yolo: bool, now: i64)
+  : String ! Refusal {
   let b = self.find_box(box_name) else {
     return fail Refusal::NoSuchBox;
   };
@@ -191,19 +193,23 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, prompt
   if (!has_text(parse(self.boxes[b].agents.as_str()) ?? Json::Null, agent)) {
     return fail Refusal::UnknownAgent;
   }
-  if (#trim(prompt) == 0) {
+  if (#trim(prompt) == 0 && image_count(images) == 0) {
     return fail Refusal::Empty;
   }
   var id = String();
   id.push_u64(self.next_id);
   self.next_id += 1;
+  var title = from_str(first_line(prompt, 120));
+  if (#trim(title.as_str()) == 0) {
+    title = from_str("Image");
+  }
   self.tasks.push(Task {
     id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent),
-    title: from_str(first_line(prompt, 120)), session: String(), preview: String(), activity: String(),
+    title, session: String(), preview: String(), activity: String(),
     state: TaskState::Working, archived: false, yolo, created: now, updated: now, turns: 0, entries: new::<String>(),
     entry_ids: new::<String>()
   });
-  self.send_turn(self.tasks.len() - 1, prompt, now);
+  self.send_turn(self.tasks.len() - 1, prompt, images, now);
   return id;
 }
 
@@ -261,11 +267,11 @@ fn Board::attach_session(var self&, box_name: str, session: str, yolo: bool, now
   return id;
 }
 
-fn Board::steer(var self&, id: str, prompt: str, now: i64): () ! Refusal {
+fn Board::steer(var self&, id: str, prompt: str, images&: Json, now: i64): () ! Refusal {
   let i = self.find_task(id) else {
     return fail Refusal::NoSuchTask;
   };
-  if (#trim(prompt) == 0) {
+  if (#trim(prompt) == 0 && image_count(images) == 0) {
     return fail Refusal::Empty;
   }
   let b = self.find_box(self.tasks[i].box_name.as_str()) else {
@@ -275,13 +281,21 @@ fn Board::steer(var self&, id: str, prompt: str, now: i64): () ! Refusal {
     return fail Refusal::BoxOffline;
   }
   self.tasks[i].archived = false;
-  self.send_turn(i, prompt, now);
+  self.send_turn(i, prompt, images, now);
   return ();
 }
 
+fn image_count(images&: Json): usize {
+  if (let list = as_array(images)) {
+    return #list;
+  }
+  return 0;
+}
+
 // Records the user's message and queues a turn for the task's box. The
-// worker runs it after any turn still in flight.
-fn Board::send_turn(var self&, i: usize, prompt: str, now: i64): () {
+// worker runs it after any turn still in flight. `images` hold their data,
+// which goes to the worker; the thread keeps their ids.
+fn Board::send_turn(var self&, i: usize, prompt: str, images&: Json, now: i64): () {
   self.tasks[i].turns += 1;
   var turn = from_str("t");
   turn.push_u64(self.tasks[i].turns as u64);
@@ -293,6 +307,16 @@ fn Board::send_turn(var self&, i: usize, prompt: str, now: i64): () {
   set(entry, "kind", text("user"));
   set(entry, "text", text(prompt));
   set(entry, "at", number(now as f64));
+  if (image_count(images) > 0) {
+    var shown = array();
+    for (let img& in as_array(images)!) {
+      var o = object();
+      set(o, "id", text(str_of(img, "id") ?? ""));
+      set(o, "type", text(str_of(img, "type") ?? ""));
+      push(shown, o);
+    }
+    set(entry, "images", shown);
+  }
   self.put_entry(i, entry, now);
 
   var msg = object();
@@ -304,6 +328,9 @@ fn Board::send_turn(var self&, i: usize, prompt: str, now: i64): () {
   set(msg, "session", text(self.tasks[i].session.as_str()));
   set(msg, "text", text(prompt));
   set(msg, "yolo", boolean(self.tasks[i].yolo));
+  if (image_count(images) > 0) {
+    set(msg, "images", copy(images));
+  }
   if (let b = self.find_box(self.tasks[i].box_name.as_str())) {
     self.boxes[b].outbox.push(to_string(msg));
   }

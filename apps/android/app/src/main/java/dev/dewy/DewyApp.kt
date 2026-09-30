@@ -7,6 +7,8 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import dev.dewy.alerts.Alerts
 import dev.dewy.alerts.WatchService
 import dev.dewy.settings.ConnectionSettings
+import dev.dewy.images.ImageStore
+import dev.dewy.images.sweepStaged
 import dev.dewy.tasks.DewyCache
 import dev.dewy.tasks.Link
 import dev.dewy.tasks.ReadMarks
@@ -32,12 +34,18 @@ class DewyApp : Application() {
         private set
     lateinit var alerts: Alerts
         private set
+    lateinit var images: ImageStore
+        private set
 
     override fun onCreate() {
         super.onCreate()
         settings = ConnectionSettings(this)
         readMarks = ReadMarks(this)
         store = TaskStore(settings.connection, DewyCache(this), scope)
+        images = ImageStore(this, fetch = store::imageBytes)
+        scope.launch(Dispatchers.IO) { sweepStaged(this@DewyApp) }
+        // Images of an orchestrator the app left are not kept.
+        scope.launch { settings.connection.filter { it == null }.collect { images.clear() } }
         alerts = Alerts(this)
         // Only live boards count: the cached one at start is not news.
         alerts.watch(store.board.filter { it.link == Link.Live }.map { it.tasks }, settings.notify, scope)

@@ -33,6 +33,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import dev.dewy.images.discardStaged
+import dev.dewy.images.uploadImages
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -94,6 +97,7 @@ fun Shell(
 
     val seen = readMarks.seen.collectAsStateWithLifecycle(emptyMap())
     val yolo by settings.yolo.collectAsStateWithLifecycle(false)
+    val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
     val stack = rememberNavBackStack(Route.Folders, Route.Tasks(Folder.All))
     var composing by rememberSaveable { mutableStateOf(false) }
@@ -135,7 +139,10 @@ fun Shell(
             draft = draft,
             yolo = yolo,
             onYolo = { on -> scope.launch { settings.setYolo(on) } },
-            onStart = store::startTask,
+            onStart = { box, project, agent, text, images, yolo ->
+                store.startTask(box, project, agent, text, uploadImages(appContext, store, images), yolo)
+                    .also { discardStaged(images) }
+            },
             onStarted = { task ->
                 composing = false
                 openDetail(Route.Thread(task.id))
@@ -181,6 +188,7 @@ private class Screens(
     @Composable
     fun Content(route: Route, wide: Boolean) {
         val onBack: (() -> Unit)? = if (wide) null else ::back
+        val context = LocalContext.current.applicationContext
         when (route) {
             Route.Folders -> FoldersScreen(
                 board = board,
@@ -214,7 +222,7 @@ private class Screens(
                 },
             )
             is Route.Thread -> {
-                val model = viewModel(key = route.taskId) { ThreadViewModel(route.taskId, store, readMarks) }
+                val model = viewModel(key = route.taskId) { ThreadViewModel(route.taskId, store, readMarks, context) }
                 ThreadScreen(model, alerts, onBack)
             }
             is Route.BoxInfo -> BoxScreen(

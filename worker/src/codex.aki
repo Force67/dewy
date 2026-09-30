@@ -13,7 +13,7 @@ import {find} from akibase::strings::string_search;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 
-pub fn codex_command(text: str, session: str, yolo: bool): Command {
+pub fn codex_command(text: str, session: str, yolo: bool, images&: [String]): Command {
   var c = Command("codex");
   c.arg("exec");
   if (#session > 0) {
@@ -28,7 +28,13 @@ pub fn codex_command(text: str, session: str, yolo: bool): Command {
     c.arg("-c");
     c.arg("sandbox_mode=\"workspace-write\"");
   }
-  c.arg(text);
+  for (let p& in images) {
+    c.arg("-i");
+    c.arg(p.as_str());
+  }
+  // -i takes several files, and a prompt may start with a dash.
+  c.arg("--");
+  c.arg(#text > 0 ? text : "See the attached images.");
   return c;
 }
 

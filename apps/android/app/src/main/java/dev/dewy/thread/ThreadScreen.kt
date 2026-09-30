@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -77,11 +78,22 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
     val p = LocalPalette.current
     val task by model.task.collectAsStateWithLifecycle()
     val entries by model.entries.collectAsStateWithLifecycle()
+    val attachments by model.attachments.collectAsStateWithLifecycle()
+    val sending by model.sending.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
     var draft by rememberSaveable { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
 
     LaunchedEffect(model) { model.problems.collect { snackbar.showSnackbar(it) } }
+    // Your own message is followed even when the thread was not at its end:
+    // the attachments above the composer can push the last entry out of view.
+    var followNext by remember { mutableStateOf(false) }
+    LaunchedEffect(model) {
+        model.sent.collect {
+            draft = ""
+            followNext = true
+        }
+    }
     LifecycleStartEffect(task?.id) {
         alerts.openThread.value = task?.id
         task?.id?.let(alerts::dismiss)
@@ -144,11 +156,12 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
                         else -> "Message ${agentLabel(t.agent)}…"
                     },
                     canStop = t?.state?.isLive == true,
-                    onSend = {
-                        model.send(draft.trim())
-                        draft = ""
-                    },
+                    onSend = { model.sendDraft(draft.trim()) },
                     onStop = model::stop,
+                    attachments = attachments,
+                    onAttach = model::attach,
+                    onRemove = model::detach,
+                    sending = sending,
                 )
             }
         },
@@ -166,7 +179,8 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
         LaunchedEffect(listState) {
             var lastCount = 0
             snapshotFlow { listState.layoutInfo.totalItemsCount }.collect { count ->
-                val atBottom = !listState.canScrollForward || lastCount == 0
+                val atBottom = !listState.canScrollForward || lastCount == 0 || followNext
+                if (count > lastCount) followNext = false
                 if (count > lastCount && atBottom) listState.animateScrollToItem((count - 1).coerceAtLeast(0))
                 lastCount = count
             }

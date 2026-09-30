@@ -4,14 +4,16 @@
 
 module worker::turn;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector} from akibase::containers::vector;
+import {String, from_str, with_nul} from akibase::strings::base_string;
+import {Vector, new} from akibase::containers::vector;
 import {spawn_error_message, exit_code} from akibase::process::child;
 import {Json, parse, object, set, text, to_string} from akibase::text::json;
 import {SharedPointer} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
 import {Atomic} from akibase::atomic;
-import {read_file, delete_file} from akibase::filesystem::file_util;
+import {read_file, write_file, delete_file} from akibase::filesystem::file_util;
+import {decode} from wire::base64;
+import {write_bytes} from wire::files;
 import {temp_directory} from akibase::filesystem::common_directory_providers;
 import {join} from akibase::filesystem::path;
 import {system_now} from akibase::time::time;
@@ -20,7 +22,7 @@ import {clip} from wire::clip;
 import {said, entry_message} from worker::entry;
 import {Transcript} from worker::transcript;
 import {make_fifo} from worker::fifo;
-import {claude_command, read_claude} from worker::claude_code;
+import {claude_command, claude_input, read_claude} from worker::claude_code;
 import {codex_command, read_codex} from worker::codex;
 import {find_session, end_session} from worker::terminal;
 
@@ -49,6 +51,13 @@ pub struct Outbox : Send {
   pub var ended: Vector<Ended>
 }
 
+// An image for the turn's prompt, its data in base64.
+pub struct TurnImage : Send {
+  pub var id: String
+  pub var media: String
+  pub var data: String
+}
+
 pub struct TurnOrder : Send {
   pub var task: String
   pub var turn: String
@@ -58,6 +67,7 @@ pub struct TurnOrder : Send {
   pub var text: String
   // The task asked to run without permission prompts.
   pub var yolo: bool
+  pub var images: Vector<TurnImage>
 }
 
 pub struct TurnJob : Send {
@@ -98,12 +108,14 @@ pub fn run_turn(job: TurnJob): () {
   stem.push_str(task);
   stem.push_c8('-');
   stem.push_i64(system_now().unix_nanoseconds());
-  let out_path = join(temp_directory().as_str(), stem.as_str());
+  let out_path = join(private_temp().as_str(), stem.as_str());
   var err_path = out_path.clone();
   err_path.push_str(".err");
 
   var t = Transcript(o.turn.as_str(), o.session.as_str());
   post(job.outbox, state_message(task, "working"));
+  var inputs = new::<String>();
+  let prepared = image_files(o, out_path.as_str(), inputs);
   // Two writers on one session diverge, so a terminal still running it
   // ends first.
   if (o.agent == Agent::Claude && !o.session.is_empty()) {
@@ -112,7 +124,15 @@ pub fn run_turn(job: TurnJob): () {
       post(job.outbox, entry_message(task, said(t.next_id().as_str(), "note", "Took over from the terminal.")));
     }
   }
-  var ok = run_agent(job, out_path.as_str(), err_path.as_str(), t);
+  var ok = false;
+  if (let images = prepared) {
+    ok = run_agent(job, out_path.as_str(), err_path.as_str(), images.as_slice(), t);
+  } else {
+    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", "The worker could not prepare the images for this message.")));
+  }
+  for (let p& in inputs) {
+    let _ = delete_file(p.as_str());
+  }
   if (t.failed) {
     ok = false;
   }
@@ -126,21 +146,93 @@ pub fn run_turn(job: TurnJob): () {
     });
 }
 
+fn extension(media: str): str<'static> => match (media) {
+  "image/jpeg" => ".jpg",
+  "image/webp" => ".webp",
+  "image/gif" => ".gif",
+  _ => ".png",
+};
+
+// Writes the turn's images where its agent takes them: Claude reads a
+// stream-json message on standard input, which becomes the first of the
+// returned paths; Codex gets files. Every file written lands in `inputs`.
+// None when an image could not be written, rather than a turn without it.
+fn image_files(o&: TurnOrder, stem: str, var inputs&: Vector<String>): Vector<String>? {
+  var paths = new::<String>();
+  if (o.images.is_empty()) {
+    return paths;
+  }
+  if (o.agent == Agent::Claude) {
+    var pairs = new::<(str, str)>();
+    for (let img& in o.images) {
+      pairs.push((img.media.as_str(), img.data.as_str()));
+    }
+    var p = from_str(stem);
+    p.push_str(".in");
+    if (let _ = write_file(p.as_str(), claude_input(o.text.as_str(), pairs.as_slice()).as_str())) {
+      inputs.push(p.clone());
+      paths.push(p);
+      return paths;
+    }
+    return none;
+  }
+  var n: u64 = 0;
+  for (let img& in o.images) {
+    let data = decode(img.data.as_str()) else {
+      return none;
+    };
+    var p = from_str(stem);
+    p.push_str(".img");
+    p.push_u64(n);
+    p.push_str(extension(img.media.as_str()));
+    n += 1;
+    if (!write_bytes(p.as_str(), data.as_slice())) {
+      return none;
+    }
+    inputs.push(p.clone());
+    paths.push(p);
+  }
+  return paths;
+}
+
+extern("mkdir") fn c_mkdir(path: *const c8, mode: u32): i32;
+extern("chmod") fn c_chmod(path: *const c8, mode: u32): i32;
+extern("getuid") fn c_getuid(): u32;
+
+// A directory only this user can read, for a turn's output and the images
+// it hands the agent, which may be private screenshots.
+fn private_temp(): String {
+  var name = from_str("dewy-worker-");
+  var uid: u32 = 0;
+  unsafe {
+    uid = c_getuid();
+  }
+  name.push_u64(uid as u64);
+  let dir = join(temp_directory().as_str(), name.as_str());
+  let c = with_nul(dir.as_str());
+  unsafe {
+    let _ = c_mkdir(@ptr(c.as_str()), 0o700);
+    let _ = c_chmod(@ptr(c.as_str()), 0o700);
+  }
+  return dir;
+}
+
 // Runs the agent to the end; false when it could not start or exited
 // with an error.
-fn run_agent(job&: TurnJob, out_path: str, err_path: str, var t&: Transcript): bool {
+fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var t&: Transcript): bool {
   let o& = job.order;
   let task = o.task.as_str();
   var fifo = make_fifo(out_path) else {
     post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", "The worker could not create a pipe.")));
     return false;
   };
+  let on_stdin = o.agent == Agent::Claude && #images > 0;
   var cmd = match (o.agent) {
-    Agent::Claude => claude_command(o.text.as_str(), o.session.as_str(), job.yolo),
-    Agent::Codex => codex_command(o.text.as_str(), o.session.as_str(), job.yolo),
+    Agent::Claude => claude_command(o.text.as_str(), o.session.as_str(), job.yolo, on_stdin),
+    Agent::Codex => codex_command(o.text.as_str(), o.session.as_str(), job.yolo, images),
   };
   cmd.current_dir(o.project.as_str());
-  cmd.stdin_from("/dev/null");
+  cmd.stdin_from(on_stdin ? images[0].as_str() : "/dev/null");
   cmd.stdout_to(out_path);
   cmd.stderr_to(err_path);
   cmd.new_process_group();

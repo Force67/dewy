@@ -41,7 +41,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
+import android.net.Uri
+import dev.dewy.images.AttachButton
+import dev.dewy.images.AttachmentRow
+import dev.dewy.images.discardStaged
+import dev.dewy.images.MaxImages
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -60,6 +66,9 @@ import dev.dewy.ui.Type
 import dev.dewy.ui.agentLabel
 import kotlinx.coroutines.launch
 
+// Picked images survive a rotation as strings; a Uri is not Serializable.
+private val UriListSaver = listSaver<List<Uri>, String>(save = { it.map(Uri::toString) }, restore = { it.map(Uri::parse) })
+
 /** Where a new task should start, when the user picked it before opening the sheet. */
 data class Draft(val box: String? = null, val project: String? = null)
 
@@ -70,7 +79,7 @@ fun NewTaskSheet(
     draft: Draft,
     yolo: Boolean,
     onYolo: (Boolean) -> Unit,
-    onStart: suspend (box: String, project: String, agent: String, text: String, yolo: Boolean) -> Task,
+    onStart: suspend (box: String, project: String, agent: String, text: String, images: List<Uri>, yolo: Boolean) -> Task,
     onStarted: (Task) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -84,6 +93,7 @@ fun NewTaskSheet(
     var project by rememberSaveable(boxName) { mutableStateOf(draft.project.takeIf { draft.box == boxName }) }
     var query by rememberSaveable { mutableStateOf("") }
     var text by rememberSaveable { mutableStateOf("") }
+    var images by rememberSaveable(stateSaver = UriListSaver) { mutableStateOf(listOf<Uri>()) }
     var busy by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
 
@@ -176,6 +186,18 @@ fun NewTaskSheet(
             }
 
             Row(
+                Modifier.padding(start = 8.dp, end = 16.dp, top = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                AttachButton(room = MaxImages - images.size, onPicked = { images = (images + it).distinct().take(MaxImages) })
+                AttachmentRow(images, onRemove = { uri ->
+                    images = images - uri
+                    scope.launch { discardStaged(listOf(uri)) }
+                })
+            }
+
+            Row(
                 Modifier
                     .padding(horizontal = 16.dp)
                     .padding(top = 12.dp)
@@ -200,14 +222,14 @@ fun NewTaskSheet(
                 Text(problem!!, style = Type.footnote, color = p.red, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp))
             }
             Spacer(Modifier.height(16.dp))
-            val ready = box != null && agent != null && project != null && text.isNotBlank() && !busy
+            val ready = box != null && agent != null && project != null && (text.isNotBlank() || images.isNotEmpty()) && !busy
             Button(
                 onClick = {
                     busy = true
                     problem = null
                     scope.launch {
                         try {
-                            val task = onStart(box!!.name, project!!, agent!!, text.trim(), yolo)
+                            val task = onStart(box!!.name, project!!, agent!!, text.trim(), images, yolo)
                             sheet.hide()
                             onStarted(task)
                         } catch (e: Exception) {

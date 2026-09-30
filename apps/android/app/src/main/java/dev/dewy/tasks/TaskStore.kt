@@ -160,8 +160,8 @@ class TaskStore(connection: Flow<Connection?>, private val cache: DewyCache, pri
         threads.value.keys.forEach { id -> scope.launch { runCatching { download(id) } } }
     }
 
-    suspend fun startTask(box: String, project: String, agent: String, text: String, yolo: Boolean): Task {
-        val task = requireClient().startTask(box, project, agent, text, yolo)
+    suspend fun startTask(box: String, project: String, agent: String, text: String, images: List<String>, yolo: Boolean): Task {
+        val task = requireClient().startTask(box, project, agent, text, images, yolo)
         upsert(task)
         return task
     }
@@ -172,7 +172,11 @@ class TaskStore(connection: Flow<Connection?>, private val cache: DewyCache, pri
         return task
     }
 
-    suspend fun steer(id: String, text: String) = requireClient().steer(id, text)
+    suspend fun steer(id: String, text: String, images: List<String> = emptyList()) = requireClient().steer(id, text, images)
+
+    suspend fun uploadImage(bytes: ByteArray, type: String): String = requireClient().uploadImage(bytes, type)
+
+    suspend fun imageBytes(id: String): ByteArray = requireClient().image(id)
 
     suspend fun stop(id: String) = requireClient().stop(id)
 

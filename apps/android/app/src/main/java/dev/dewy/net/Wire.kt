@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -106,10 +107,21 @@ data class Entry(val fields: JsonObject) {
     val toolState get() = str("state")
     val at get() = (fields["at"] as? JsonPrimitive)?.content?.toDoubleOrNull()?.toLong() ?: 0L
 
+    /** Images you attached, or that the agent looked at. */
+    val images: List<ImageRef>
+        get() = (fields["images"] as? JsonArray).orEmpty().mapNotNull { v ->
+            val o = v as? JsonObject ?: return@mapNotNull null
+            val id = (o["id"] as? JsonPrimitive)?.content ?: return@mapNotNull null
+            ImageRef(id, (o["type"] as? JsonPrimitive)?.content.orEmpty())
+        }
+
     private fun str(key: String) = (fields[key] as? JsonPrimitive)?.content ?: ""
 
     fun mergedWith(update: Entry) = Entry(JsonObject(fields + update.fields))
 }
+
+/** An image stored on the orchestrator, named by the SHA-256 of its bytes. */
+data class ImageRef(val id: String, val type: String)
 
 enum class EntryKind {
     User, Agent, Tool, Note, Error;

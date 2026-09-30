@@ -9,7 +9,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.add
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -40,12 +42,13 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
     suspend fun thread(id: String): TaskThread =
         call(request("api/tasks/$id").get().build()) { wireJson.decodeFromString(it) }
 
-    suspend fun startTask(box: String, project: String, agent: String, text: String, yolo: Boolean): Task {
+    suspend fun startTask(box: String, project: String, agent: String, text: String, images: List<String>, yolo: Boolean): Task {
         val body = buildJsonObject {
             put("box", box)
             put("project", project)
             put("agent", agent)
             put("text", text)
+            putJsonArray("images") { images.forEach { add(it) } }
             put("yolo", yolo)
         }
         return call(request("api/tasks").post(body.toString().toRequestBody(jsonType)).build()) {
@@ -64,8 +67,27 @@ class DewyClient(serverUrl: String, private val token: String, private val http:
         }
     }
 
-    suspend fun steer(id: String, text: String) =
-        post("api/tasks/$id/messages", buildJsonObject { put("text", text) }.toString())
+    suspend fun steer(id: String, text: String, images: List<String> = emptyList()) =
+        post(
+            "api/tasks/$id/messages",
+            buildJsonObject {
+                put("text", text)
+                putJsonArray("images") { images.forEach { add(it) } }
+            }.toString(),
+        )
+
+    /** Stores an image on the orchestrator; the answer is its id. */
+    suspend fun uploadImage(bytes: ByteArray, type: String): String =
+        call(request("api/images").post(bytes.toRequestBody(type.toMediaType())).build()) {
+            (wireJson.parseToJsonElement(it) as JsonObject).getValue("id").let { v -> (v as JsonPrimitive).content }
+        }
+
+    suspend fun image(id: String): ByteArray = withContext(Dispatchers.IO) {
+        http.newCall(request("api/images/$id").get().build()).await().use { response ->
+            if (!response.isSuccessful) throw ServerException(response.code, "the server answered ${response.code}")
+            response.body.bytes()
+        }
+    }
 
     suspend fun stop(id: String) = post("api/tasks/$id/stop", "{}")
 

@@ -6,7 +6,7 @@ module worker::crew;
 
 import {String, from_str} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
-import {Json, array, push, text} from akibase::text::json;
+import {Json, array, push, text, get, as_array} from akibase::text::json;
 import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
 import {Atomic} from akibase::atomic;
@@ -15,7 +15,7 @@ import {send_signal, kSignalTerminate} from akibase::process::child;
 import {replace} from akibase::algorithm;
 import {str_of, string_of, bool_of} from wire::fields;
 import {said, entry_message} from worker::entry;
-import {Ended, Outbox, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
+import {Ended, Outbox, TurnImage, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
 import {find_session} from worker::terminal;
 import {WatchJob, watch_session} from worker::watch;
 
@@ -81,7 +81,8 @@ fn Crew::order(var self&, msg&: Json): () {
   };
   let o = TurnOrder {
     task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
-    session: string_of(msg, "session"), text: string_of(msg, "text"), yolo: bool_of(msg, "yolo") ?? false
+    session: string_of(msg, "session"), text: string_of(msg, "text"), yolo: bool_of(msg, "yolo") ?? false,
+    images: turn_images(msg)
   };
   if (self.is_running(task)) {
     self.waiting.push(o);
@@ -94,6 +95,16 @@ fn Crew::order(var self&, msg&: Json): () {
   } else {
     self.start(o);
   }
+}
+
+fn turn_images(msg&: Json): Vector<TurnImage> {
+  var out = new::<TurnImage>();
+  if (let list = as_array(get(msg, "images") ?? Json::Null)) {
+    for (let img& in list) {
+      out.push(TurnImage { id: string_of(img, "id"), media: string_of(img, "type"), data: string_of(img, "data") });
+    }
+  }
+  return out;
 }
 
 fn Crew::start(var self&, o: TurnOrder): () {

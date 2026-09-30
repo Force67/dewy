@@ -7,16 +7,23 @@ module worker::claude_code;
 import {String, from_str} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
 import {Command} from akibase::process::child;
-import {Json, get, as_array, as_str, path} from akibase::text::json;
+import {Json, object, array, set, push, text, to_string, get, as_array, as_str, path} from akibase::text::json;
 import {str_of, bool_of} from wire::fields;
 import {first_line} from wire::clip;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 
-pub fn claude_command(text: str, session: str, yolo: bool): Command {
+// With `on_stdin`, the prompt comes as a stream-json user message on
+// standard input, which is how images reach Claude.
+pub fn claude_command(text: str, session: str, yolo: bool, on_stdin: bool): Command {
   var c = Command("claude");
   c.arg("-p");
-  c.arg(text);
+  if (on_stdin) {
+    c.arg("--input-format");
+    c.arg("stream-json");
+  } else {
+    c.arg(text);
+  }
   c.arg("--output-format");
   c.arg("stream-json");
   c.arg("--verbose");
@@ -57,7 +64,9 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
       } else if (block == "tool_result") {
         let id = t.id_for(str_of(b, "tool_use_id") ?? "");
         let ok = !(bool_of(b, "is_error") ?? false);
-        out.push(tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str()));
+        var done = tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str());
+        with_images(done, images_in(get(b, "content") ?? Json::Null));
+        out.push(done);
       }
     }
   } else if (kind == "result") {
@@ -102,8 +111,12 @@ pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
   if (kind == "attachment" && (str_of(path(line, "attachment") ?? Json::Null, "type") ?? "") == "queued_command") {
     if (let a = path(line, "attachment")) {
       let prompt = result_text(get(a, "prompt") ?? Json::Null);
-      if ((as_str(path(a, "origin.kind") ?? Json::Null) ?? "") == "human" && prompt.len() > 0) {
-        out.push(said(t.id_for(uuid).as_str(), "user", prompt.as_str()));
+      let pasted = images_in(get(a, "prompt") ?? Json::Null);
+      let has_images = #as_array(pasted)! > 0;
+      if ((as_str(path(a, "origin.kind") ?? Json::Null) ?? "") == "human" && (prompt.len() > 0 || has_images)) {
+        var e = said(t.id_for(uuid).as_str(), "user", prompt.as_str());
+        with_images(e, pasted);
+        out.push(e);
       }
     }
     return out;
@@ -140,9 +153,88 @@ pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
     } else if (block == "tool_result" && kind == "user") {
       let id = t.id_for(str_of(b, "tool_use_id") ?? "");
       let ok = !(bool_of(b, "is_error") ?? false);
-      out.push(tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str()));
+      var done = tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str());
+      with_images(done, images_in(get(b, "content") ?? Json::Null));
+      out.push(done);
     }
   }
+  // Images pasted into a prompt come as their own entry, before its text.
+  if (kind == "user" && human) {
+    let pasted = images_in(path(line, "message.content") ?? Json::Null);
+    if (#as_array(pasted)! > 0) {
+      var e = said(t.id_for(uuid).as_str(), "user", "");
+      with_images(e, pasted);
+      out.insert(0, e);
+    }
+  }
+  return out;
+}
+
+// Images whose base64 would take an entry past this stay out, so it keeps
+// under the line limit.
+comptime let kMaxImageText: usize = 6 << 20;
+
+// The image blocks among content, as {type, data} for the orchestrator to
+// store.
+fn images_in(content&: Json): Json {
+  var out = array();
+  var total: usize = 0;
+  if (let blocks = as_array(content)) {
+    for (let b& in blocks) {
+      if ((str_of(b, "type") ?? "") != "image") {
+        continue;
+      }
+      if (let src = get(b, "source")) {
+        let data = str_of(src, "data") ?? "";
+        // The cap holds for the entry, whose images travel in one line.
+        if ((str_of(src, "type") ?? "") == "base64" && #data > 0 && total + #data <= kMaxImageText) {
+          total += #data;
+          var o = object();
+          set(o, "type", text(str_of(src, "media_type") ?? "image/png"));
+          set(o, "data", text(data));
+          push(out, o);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+fn with_images(var e&: Json, images: Json): () {
+  if (let list = as_array(images)) {
+    if (#list > 0) {
+      set(e, "images", images);
+    }
+  }
+}
+
+// The stream-json user message that gives Claude a prompt and images.
+pub fn claude_input(prompt: str, images&: [(str, str)]): String {
+  var content = array();
+  for (let img& in images) {
+    var src = object();
+    set(src, "type", text("base64"));
+    set(src, "media_type", text(img.0));
+    set(src, "data", text(img.1));
+    var block = object();
+    set(block, "type", text("image"));
+    set(block, "source", src);
+    push(content, block);
+  }
+  if (#prompt > 0) {
+    var block = object();
+    set(block, "type", text("text"));
+    set(block, "text", text(prompt));
+    push(content, block);
+  }
+  var message = object();
+  set(message, "role", text("user"));
+  set(message, "content", content);
+  var line = object();
+  set(line, "type", text("user"));
+  set(line, "message", message);
+  var out = to_string(line);
+  out.push_c8('\n');
   return out;
 }
 

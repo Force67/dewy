@@ -41,5 +41,16 @@
         <receiver
             android:name=".alerts.ReplyReceiver"
             android:exported="false" />
+
+        <!-- The camera writes photos for attachments into the app's cache. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/files" />
+        </provider>
     </application>
 </manifest>

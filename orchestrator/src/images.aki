@@ -1,0 +1,94 @@
+// Images, named by the SHA-256 of their bytes in hex and kept under
+// <data>/images: the bytes as <id>, the media type as <id>.type.
+
+module orchestrator::images;
+
+import {String, from_str} from akibase::strings::base_string;
+import {Vector} from akibase::containers::vector;
+import {read_file, write_file, rename_file, delete_file, path_exists} from akibase::filesystem::file_util;
+import {system_now} from akibase::time::time;
+import {create_directories} from akibase::filesystem::directory;
+import {join} from akibase::filesystem::path;
+import {trim} from akibase::strings::string_search;
+import {sha256} from akibase::hashing::sha256;
+import {read_bytes, write_bytes} from wire::files;
+
+// An image, and all of a message's images together, stay small enough that
+// their base64 fits the 8 MiB line a turn travels in.
+pub comptime let kMaxImage: usize = 4 << 20;
+pub comptime let kMaxImages: usize = 4608 << 10;
+
+pub fn is_image_type(t: str): bool => t == "image/jpeg" || t == "image/png" || t == "image/webp" || t == "image/gif";
+
+pub fn valid_id(id: str): bool {
+  if (#id != 64) {
+    return false;
+  }
+  for (let c in id) {
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn path_of(data_dir: str, id: str): String => join(join(data_dir, "images").as_str(), id);
+
+// Stores an image and returns its id; one stored before is kept as it is.
+pub fn store(data_dir: str, bytes_: bytes, media: str): String? {
+  if (#bytes_ == 0 || #bytes_ > kMaxImage || !is_image_type(media)) {
+    return none;
+  }
+  let digest = sha256(bytes_);
+  var id = String();
+  let hex = "0123456789abcdef";
+  for (let b in digest) {
+    id.push_c8(hex[(b >> 4) as usize]);
+    id.push_c8(hex[(b & 15) as usize]);
+  }
+  let p = path_of(data_dir, id.as_str());
+  if (path_exists(p.as_str())) {
+    return id;
+  }
+  let _ = create_directories(join(data_dir, "images").as_str());
+  // The type goes first: an image file without one would not be served.
+  var type_path = p.clone();
+  type_path.push_str(".type");
+  if (let _ = write_file(type_path.as_str(), media)) {
+  } else {
+    return none;
+  }
+  // Another thread may store the same image at once, so each writes its own.
+  var tmp = p.clone();
+  tmp.push_str(".part");
+  tmp.push_i64(system_now().unix_nanoseconds());
+  if (!write_bytes(tmp.as_str(), bytes_)) {
+    return none;
+  }
+  if (let _ = rename_file(tmp.as_str(), p.as_str())) {
+    return id;
+  }
+  let _ = delete_file(tmp.as_str());
+  return path_exists(p.as_str()) ? id : none;
+}
+
+pub struct Image {
+  pub var data: Vector<u8>
+  pub var media: String
+}
+
+pub fn load(data_dir: str, id: str): Image? {
+  if (!valid_id(id)) {
+    return none;
+  }
+  let p = path_of(data_dir, id);
+  var type_path = p.clone();
+  type_path.push_str(".type");
+  let media = read_file(type_path.as_str()) else {
+    return none;
+  };
+  let data = read_bytes(p.as_str()) else {
+    return none;
+  };
+  return Image { data, media: from_str(trim(media.as_str())) };
+}

@@ -57,7 +57,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.dewy.images.ImageStrip
 import dev.dewy.net.Entry
+import dev.dewy.net.ImageRef
 import dev.dewy.net.EntryKind
 import dev.dewy.ui.CardShape
 import dev.dewy.ui.LocalPalette
@@ -69,7 +71,7 @@ private val BubbleShape = RoundedCornerShape(20.dp, 20.dp, 6.dp, 20.dp)
 @Composable
 fun SaidView(entry: Entry) {
     when (entry.kind) {
-        EntryKind.User -> UserBubble(entry.text)
+        EntryKind.User -> UserBubble(entry.text, entry.images)
         EntryKind.Agent -> Markdown(entry.text, Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp))
         EntryKind.Note -> Callout(entry.text, Icons.Rounded.Info, LocalPalette.current.amber)
         EntryKind.Error -> Callout(entry.text, Icons.Rounded.ErrorOutline, LocalPalette.current.red)
@@ -78,8 +80,10 @@ fun SaidView(entry: Entry) {
 }
 
 @Composable
-private fun UserBubble(text: String) {
+private fun UserBubble(text: String, images: List<ImageRef>) {
     val p = LocalPalette.current
+    ImageStrip(images, 120.dp, Modifier.fillMaxWidth().padding(start = 56.dp, end = 16.dp, top = 10.dp), alignEnd = true)
+    if (text.isBlank()) return
     Box(Modifier.fillMaxWidth().padding(start = 56.dp, end = 16.dp, top = 10.dp, bottom = 6.dp), contentAlignment = Alignment.CenterEnd) {
         SelectionContainer {
             Text(
@@ -178,6 +182,8 @@ private fun ToolRow(tool: Entry) {
             )
             ToolState(tool.toolState)
         }
+        // What the agent looked at shows even with the output folded.
+        ImageStrip(tool.images, 96.dp, Modifier.padding(start = 41.dp, end = 14.dp, bottom = 8.dp))
         AnimatedVisibility(open && hasOutput, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
             SelectionContainer {
                 Text(

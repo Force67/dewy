@@ -1,0 +1,41 @@
+// Base64 against RFC 4648's vectors, and a round trip of every byte.
+
+module base64_test;
+
+import {new} from akibase::containers::vector;
+import {str_as_bytes} from akibase::strings::base_string;
+import {eprintln} from akibase::logging;
+import {encode, decode} from wire::base64;
+
+fn check(ok: bool, what: str, var failures&: i32): () {
+  if (!ok) {
+    eprintln(what);
+    failures += 1;
+  }
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  let plain = ["", "f", "fo", "foo", "foob", "fooba", "foobar"];
+  let coded = ["", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"];
+  for (let i in 0usize..7) {
+    check(encode(str_as_bytes(plain[i])).as_str() == coded[i], "encodes the RFC 4648 vectors", failures);
+    let back = decode(coded[i])!;
+    check(back.len() == #plain[i], "decodes the RFC 4648 vectors", failures);
+  }
+  var all = new::<u8>();
+  for (let b in 0u32..256) {
+    all.push(b as u8);
+  }
+  let text = encode(all.as_slice());
+  let round = decode(text.as_str())!;
+  var same = round.len() == 256;
+  for (let i in 0usize..256) {
+    if (same && round[i] != all[i]) {
+      same = false;
+    }
+  }
+  check(same, "every byte round-trips", failures);
+  check(decode("Zm9v!") == none, "refuses what is not base64", failures);
+  return failures;
+}

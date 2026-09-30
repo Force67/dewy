@@ -9,7 +9,7 @@ import {Json, parse, to_string} from akibase::text::json;
 import {lines} from akibase::strings::string_util;
 import {eprintln} from akibase::logging;
 import {Transcript} from worker::transcript;
-import {read_claude, read_terminal} from worker::claude_code;
+import {read_claude, read_terminal, claude_input} from worker::claude_code;
 import {read_codex} from worker::codex;
 
 comptime let kClaude: str = r"""
@@ -42,6 +42,15 @@ comptime let kTerminal: str = r"""
 {"type":"assistant","uuid":"a2","message":{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"33 files."}]}}
 {"type":"attachment","uuid":"q1","attachment":{"type":"queued_command","prompt":"only .kt","origin":{"kind":"human"}}}
 {"type":"ai-title","aiTitle":"Count files","sessionId":"bcef"}
+""";
+
+// A Read of a screenshot, and a terminal prompt with a pasted image.
+comptime let kImages: str = r"""
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_09","type":"tool_result","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]},"session_id":"2896"}
+""";
+
+comptime let kPasted: str = r"""
+{"type":"user","origin":{"kind":"human"},"uuid":"u7","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"/9j/4AAQ"}},{"type":"text","text":"what is this?"}]}}
 """;
 
 fn check(ok: bool, what: str, var failures&: i32): () {
@@ -117,5 +126,23 @@ pub fn main(): i32 {
         "terminal tool start", failures);
   check(we[2].as_str() == "{\"id\":\"w.toolu_07\",\"state\":\"ok\",\"output\":\"33\"}", "terminal tool result", failures);
   check(we[3].as_str() == "{\"id\":\"w.a2.1\",\"kind\":\"agent\",\"text\":\"33 files.\"}", "terminal answer", failures);
+
+  var ci = Transcript("t3", "");
+  let ie = run(kImages, "claude", ci);
+  check(ie.len() == 1 && ie[0].as_str() == "{\"id\":\"t3.toolu_09\",\"state\":\"ok\",\"output\":\"\",\"images\":[{\"type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}]}",
+        "a tool result keeps its image", failures);
+
+  var tp = Transcript("w", "bcef");
+  let pe = run(kPasted, "terminal", tp);
+  check(pe.len() == 2, "a pasted image and its prompt", failures);
+  check(pe.len() == 2 && pe[0].as_str() == "{\"id\":\"w.u7\",\"kind\":\"user\",\"text\":\"\",\"images\":[{\"type\":\"image/jpeg\",\"data\":\"/9j/4AAQ\"}]}",
+        "the pasted image comes first", failures);
+  check(pe.len() == 2 && pe[1].as_str() == "{\"id\":\"w.u7.1\",\"kind\":\"user\",\"text\":\"what is this?\"}", "then the prompt", failures);
+
+  var pairs = new::<(str, str)>();
+  pairs.push(("image/png", "iVBORw0KGgo="));
+  let input = claude_input("what color?", pairs.as_slice());
+  check(input.as_str() == "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}},{\"type\":\"text\",\"text\":\"what color?\"}]}}\n",
+        "Claude's stdin message: images, then the prompt", failures);
   return failures;
 }

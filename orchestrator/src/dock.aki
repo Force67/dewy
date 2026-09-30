@@ -8,11 +8,13 @@ import {String} from akibase::strings::base_string;
 import {Vector} from akibase::containers::vector;
 import {TcpStream} from akibase::net::tcp;
 import {SharedPointer} from akibase::memory::shared_pointer;
-import {Json} from akibase::text::json;
+import {Json, object, array, set, push, get, as_array, text} from akibase::text::json;
 import {milliseconds, seconds, now} from akibase::time::time;
 import {eprintln} from akibase::logging;
 import {LineStream} from wire::line_stream;
-import {str_of} from wire::fields;
+import {str_of, copy, put} from wire::fields;
+import {decode} from wire::base64;
+import {store} from orchestrator::images;
 import {Board} from orchestrator::board;
 import {Hub, now_ms} from orchestrator::hub;
 
@@ -36,7 +38,9 @@ pub fn serve_worker(c: DockConnection): () {
   while (true) {
     if (let got = link.read()) {
       if (let msg = got) {
-        hub.board.with(fn(b: &var Board): () => b.apply(name.as_str(), msg, now_ms()));
+        var m = msg;
+        keep_images(hub.data.as_str(), m);
+        hub.board.with(fn(b: &var Board): () => b.apply(name.as_str(), m, now_ms()));
         hub.changed.notify_all();
       }
     } else {
@@ -72,4 +76,31 @@ fn read_hello(var link&: LineStream, token: str): Json? {
     }
   }
   return none;
+}
+
+// An entry carries the images an agent looked at as base64; they are stored
+// here, and the entry keeps their ids, so the board needs no I/O.
+fn keep_images(data_dir: str, var msg&: Json): () {
+  if ((str_of(msg, "type") ?? "") != "entry") {
+    return;
+  }
+  var e = copy(get(msg, "entry") ?? Json::Null);
+  let list = as_array(get(e, "images") ?? Json::Null) else {
+    return;
+  };
+  var kept = array();
+  for (let img& in list) {
+    let media = str_of(img, "type") ?? "";
+    let data = decode(str_of(img, "data") ?? "") else {
+      continue;
+    };
+    if (let id = store(data_dir, data.as_slice(), media)) {
+      var o = object();
+      set(o, "id", text(id.as_str()));
+      set(o, "type", text(media));
+      push(kept, o);
+    }
+  }
+  put(e, "images", kept);
+  put(msg, "entry", e);
 }

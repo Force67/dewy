@@ -4,11 +4,13 @@
 //
 //   GET  /api/state                   boxes and task summaries, with the feed position
 //   GET  /api/tasks/<id>              one task with its thread
-//   POST /api/tasks                   {box, project, agent, text, yolo}: start a task
-//   POST /api/tasks/<id>/messages     {text}: steer a task
+//   POST /api/tasks                   {box, project, agent, text, images, yolo}: start a task
+//   POST /api/tasks/<id>/messages     {text, images}: steer a task
 //   POST /api/tasks/<id>/stop
 //   POST /api/tasks/<id>/archive      {archived}
 //   POST /api/sessions/attach         {box, session, yolo}: follow a terminal session as a task
+//   POST /api/images                  an image's bytes, with its Content-Type: {id}
+//   GET  /api/images/<id>             the image's bytes
 //   GET  /api/stream?since=<seq>&epoch=<epoch>
 //                                     changes after seq as server-sent events
 
@@ -19,11 +21,13 @@ import {TcpStream} from akibase::net::tcp;
 import {Request, finish, header, kMaxHead, path_part, read_error_status, read_request, send_response, error_body}
   from akibase::net::http;
 import {gzip} from orchestrator::gzip;
+import {kMaxImage, kMaxImages, store, load} from orchestrator::images;
+import {encode} from wire::base64;
 import {SharedPointer} from akibase::memory::shared_pointer;
-import {Json, object, set, text, number, boolean, parse, to_string} from akibase::text::json;
+import {Json, object, array, set, push, get, as_array, as_str, text, number, boolean, parse, to_string} from akibase::text::json;
 import {utf8_lossy} from akibase::text::code_convert;
 import {split} from akibase::strings::string_util;
-import {contains, find, strip_prefix} from akibase::strings::string_search;
+import {contains, find, strip_prefix, trim} from akibase::strings::string_search;
 import {parse_u64} from akibase::strings::string_to_number;
 import {seconds} from akibase::time::time;
 import {str_of, bool_of} from wire::fields;
@@ -31,7 +35,9 @@ import {Board, Refusal, refusal_message} from orchestrator::board;
 import {Hub, now_ms} from orchestrator::hub;
 import {stream_changes} from orchestrator::stream;
 
-comptime let kMaxBody: usize = 1 << 20;
+// An image upload is the largest body.
+comptime let kMaxBody: usize = kMaxImage + (64 << 10);
+comptime let kMaxImageCount: usize = 4;
 comptime let kGzipFrom: usize = 1024;
 
 pub struct AppConnection : Send {
@@ -96,8 +102,65 @@ pub fn serve_app(c: AppConnection): () {
     stream_changes(stream, hub, query_u64(r.target.as_str(), "since="), current);
     return;
   }
+  if (r.method.eq_str("GET")) {
+    if (let id = strip_prefix(path, "/api/images/")) {
+      serve_image(stream, hub, id);
+      return;
+    }
+  }
   let reply = route(r, path, hub);
   send(stream, reply, contains(r.header("Accept-Encoding") ?? "", "gzip"));
+}
+
+// Images never change, so the app keeps them for good.
+fn serve_image(var stream&: TcpStream, hub&: Hub, id: str): () {
+  let img = load(hub.data.as_str(), id) else {
+    send(stream, error_reply(404, "no such image"), false);
+    return;
+  };
+  let extra = [header("Cache-Control", "private, max-age=31536000, immutable")];
+  let _ = send_response(stream, 200, img.media.as_str(), img.data.as_slice(), extra, true);
+  finish(stream);
+}
+
+fn upload_image(r&: Request, hub&: Hub): Reply {
+  var media = r.header("Content-Type") ?? "";
+  if (let at = find(media, ";")) {
+    media = media[..at];
+  }
+  let id = store(hub.data.as_str(), r.body.as_slice(), trim(media)) else {
+    return error_reply(400, "not a JPEG, PNG, WebP, or GIF image of at most 4 MiB");
+  };
+  var o = object();
+  set(o, "id", text(id.as_str()));
+  return json_reply(201, o);
+}
+
+// The images a message names, with their data for the worker.
+fn message_images(body&: Json, hub&: Hub): Json ! Reply {
+  var out = array();
+  let ids = as_array(get(body, "images") ?? Json::Null) else {
+    return out;
+  };
+  if (#ids > kMaxImageCount) {
+    return fail error_reply(400, "at most 4 images");
+  }
+  var total: usize = 0;
+  for (let v& in ids) {
+    let img = load(hub.data.as_str(), as_str(v) ?? "") else {
+      return fail error_reply(400, "no such image");
+    };
+    total += img.data.len();
+    if (total > kMaxImages) {
+      return fail error_reply(413, "the images are more than 4.5 MiB together");
+    }
+    var o = object();
+    set(o, "id", text(as_str(v) ?? ""));
+    set(o, "type", text(img.media.as_str()));
+    set(o, "data", text(encode(img.data.as_slice()).as_str()));
+    push(out, o);
+  }
+  return out;
 }
 
 fn send(var stream&: TcpStream, reply: Reply, gz: bool): () {
@@ -158,6 +221,9 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
   if (post && path == "/api/tasks") {
     return start_task(r, hub);
   }
+  if (post && path == "/api/images") {
+    return upload_image(r, hub);
+  }
   if (post && path == "/api/sessions/attach") {
     return attach_session(r, hub);
   }
@@ -186,9 +252,13 @@ fn route(r&: Request, path: str, hub&: Hub): Reply {
   let now = now_ms();
   let action = parts[4];
   let body = body_json(r) ?? object();
+  // Images load before the board's lock is taken.
+  let images = message_images(body, hub) else (let e) {
+    return e;
+  };
   let result = hub.board.with(fn(b: &var Board): () ! Refusal {
     if (action == "messages") {
-      return b.steer(id, str_of(body, "text") ?? "", now);
+      return b.steer(id, str_of(body, "text") ?? "", images, now);
     }
     if (action == "stop") {
       return b.stop(id, now);
@@ -211,9 +281,12 @@ fn start_task(r&: Request, hub&: Hub): Reply {
     return error_reply(400, "the body is not JSON");
   };
   let now = now_ms();
+  let images = message_images(body, hub) else (let e) {
+    return e;
+  };
   let created = hub.board.with(fn(b: &var Board): String ! Refusal => b.create_task(
     str_of(body, "box") ?? "", str_of(body, "project") ?? "", str_of(body, "agent") ?? "", str_of(body, "text") ?? "",
-    bool_of(body, "yolo") ?? false, now));
+    images, bool_of(body, "yolo") ?? false, now));
   return created_reply(created, hub);
 }
 

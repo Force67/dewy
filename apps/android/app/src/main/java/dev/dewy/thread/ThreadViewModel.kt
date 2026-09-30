@@ -1,6 +1,13 @@
 package dev.dewy.thread
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
+import dev.dewy.images.MaxImages
+import dev.dewy.images.discardStaged
+import dev.dewy.images.uploadImages
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import androidx.lifecycle.viewModelScope
 import dev.dewy.net.Entry
 import dev.dewy.net.Task
@@ -20,12 +27,19 @@ class ThreadViewModel(
     private val taskId: String,
     private val store: TaskStore,
     readMarks: ReadMarks,
+    private val context: Context,
 ) : ViewModel() {
     val task: StateFlow<Task?> = store.board.map { b -> b.tasks.find { it.id == taskId } }
         .stateIn(viewModelScope, SharingStarted.Eagerly, store.board.value.tasks.find { it.id == taskId })
 
     val entries: StateFlow<List<Entry>?> = store.thread(taskId)
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    /** Images picked for the next message. */
+    val attachments = MutableStateFlow<List<Uri>>(emptyList())
+
+    private val _sending = MutableStateFlow(false)
+    val sending: StateFlow<Boolean> = _sending
 
     private val _problems = Channel<String>(Channel.BUFFERED)
     val problems = _problems.receiveAsFlow()
@@ -41,6 +55,34 @@ class ThreadViewModel(
     fun load() = attempt { store.loadThread(taskId) }
 
     fun send(text: String) = attempt { store.steer(taskId, text) }
+
+    fun attach(uris: List<Uri>) = attachments.update { (it + uris).distinct().take(MaxImages) }
+
+    fun detach(uri: Uri) {
+        attachments.update { it - uri }
+        viewModelScope.launch { discardStaged(listOf(uri)) }
+    }
+
+    private val _sent = Channel<Unit>(Channel.BUFFERED)
+
+    /** A draft went; the screen clears it, also when it was rebuilt meanwhile. */
+    val sent = _sent.receiveAsFlow()
+
+    /** Uploads the attachments, then sends; a failure keeps the draft and the images. */
+    fun sendDraft(text: String) = attempt {
+        _sending.value = true
+        try {
+            val images = attachments.value
+            val ids = uploadImages(context, store, images)
+            store.steer(taskId, text, ids)
+            // Images picked while this was sending wait for the next message.
+            attachments.update { it - images.toSet() }
+            discardStaged(images)
+            _sent.trySend(Unit)
+        } finally {
+            _sending.value = false
+        }
+    }
 
     fun stop() = attempt { store.stop(taskId) }
 

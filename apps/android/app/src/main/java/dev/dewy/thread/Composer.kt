@@ -1,5 +1,10 @@
 package dev.dewy.thread
 
+import android.net.Uri
+import dev.dewy.images.AttachButton
+import dev.dewy.images.AttachmentRow
+import dev.dewy.images.MaxImages
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -10,6 +15,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
@@ -46,15 +52,22 @@ fun Composer(
     canStop: Boolean,
     onSend: () -> Unit,
     onStop: () -> Unit,
+    attachments: List<Uri>,
+    onAttach: (List<Uri>) -> Unit,
+    onRemove: (Uri) -> Unit,
+    sending: Boolean,
     modifier: Modifier = Modifier,
 ) {
     val p = LocalPalette.current
     val haptics = LocalHapticFeedback.current
+    Column(modifier.fillMaxWidth()) {
+    AttachmentRow(attachments, onRemove, Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp))
     Row(
-        modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        AttachButton(room = MaxImages - attachments.size, onPicked = onAttach)
         Box(
             Modifier
                 .weight(1f)
@@ -77,7 +90,8 @@ fun Composer(
             )
         }
         val mode = when {
-            text.isNotBlank() -> 1
+            sending -> 3
+            text.isNotBlank() || attachments.isNotEmpty() -> 1
             canStop -> 2
             else -> 0
         }
@@ -91,9 +105,13 @@ fun Composer(
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     onStop()
                 }
+                3 -> Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(Modifier.size(22.dp), color = p.dew, strokeWidth = 2.dp)
+                }
                 else -> RoundButton(Icons.Rounded.ArrowUpward, "Send", enabled = false) {}
             }
         }
+    }
     }
 }
 

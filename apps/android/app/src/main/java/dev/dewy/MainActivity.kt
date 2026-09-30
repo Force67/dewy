@@ -6,6 +6,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.compose.runtime.CompositionLocalProvider
+import dev.dewy.images.LocalImageStore
 import dev.dewy.shell.Shell
 import dev.dewy.ui.DewyTheme
 import kotlinx.coroutines.channels.Channel
@@ -23,13 +25,15 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) handle(intent)
         setContent {
             DewyTheme {
-                Shell(
-                    store = app.store,
-                    settings = app.settings,
-                    readMarks = app.readMarks,
-                    alerts = app.alerts,
-                    openRequests = openRequests.receiveAsFlow(),
-                )
+                CompositionLocalProvider(LocalImageStore provides app.images) {
+                    Shell(
+                        store = app.store,
+                        settings = app.settings,
+                        readMarks = app.readMarks,
+                        alerts = app.alerts,
+                        openRequests = openRequests.receiveAsFlow(),
+                    )
+                }
             }
         }
     }
