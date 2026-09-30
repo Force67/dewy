@@ -6,6 +6,9 @@ import dev.dewy.usage.ago
 import dev.dewy.usage.compactTokens
 import dev.dewy.usage.meterTitle
 import dev.dewy.usage.until
+import dev.dewy.usage.spendLine
+import dev.dewy.net.Task
+import dev.dewy.net.TaskState
 import java.util.Locale
 import dev.dewy.usage.parseCaps
 import org.junit.Assert.assertEquals
@@ -53,5 +56,20 @@ class UsageTest {
         assertEquals("3 days ago", ago(3 * 86_400_000L))
         assertEquals("2 h 14 min", until((2 * 60 + 14) * 60_000L))
         assertEquals("6 days 5 h", until((6 * 24 + 5) * 3_600_000L))
+    }
+
+    @Test
+    fun aTaskSaysWhatItUsed() {
+        Locale.setDefault(Locale.ROOT)
+        val claude = wireJson.decodeFromString<Task>(
+            """{"id":"7","box":"godbox","project":"/src","agent":"claude","title":"t","state":"working","created":1,"updated":2,
+               "spend":{"tokens":184000,"cost":0.42,"share":[{"name":"5 hours","used":0.031},{"name":"7 days","used":0.004},{"name":"x","used":0.0001}]}}""",
+        )
+        assertEquals("184K tokens · $0.42 at API prices · ≈ 3.1% of 5 hours · ≈ 0.4% of 7 days", spendLine(claude, emptyMap()))
+        val go = claude.copy(agent = "opencode", model = "opencode-go/kimi-k3", spend = claude.spend.copy(share = emptyList()))
+        assertEquals("opencode-go", go.provider)
+        assertEquals("184K tokens · $0.42 · 3.5% of the budget for 5 hours", spendLine(go, mapOf("5 hours" to 12.0)))
+        assertEquals(null, spendLine(claude.copy(spend = claude.spend.copy(tokens = 0.0, cost = 0.0)), emptyMap()))
+        assertEquals(TaskState.Working, claude.state)
     }
 }

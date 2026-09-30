@@ -60,6 +60,7 @@ import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.dewy.alerts.Alerts
 import dev.dewy.models.ModelPicker
+import dev.dewy.usage.spendLine
 import dev.dewy.models.modelLabel
 import dev.dewy.net.Task
 import dev.dewy.net.TaskState
@@ -77,7 +78,7 @@ private const val NUDGE = "Are you stuck? Give me a one-line status, then carry 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) {
+fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, budgets: Map<String, Map<String, Double>>, onBack: (() -> Unit)?) {
     val p = LocalPalette.current
     val task by model.task.collectAsStateWithLifecycle()
     val entries by model.entries.collectAsStateWithLifecycle()
@@ -195,7 +196,7 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(top = padding.calculateTopPadding(), bottom = padding.calculateBottomPadding() + 8.dp),
         ) {
-            item(key = "header") { Header(t, pickable = models.isNotEmpty(), onPickModel = { picking = true }) }
+            item(key = "header") { Header(t, budgets[t.provider].orEmpty(), pickable = models.isNotEmpty(), onPickModel = { picking = true }) }
             items(items, key = { it.key }) { item ->
                 when (item) {
                     is Item.Said -> SaidView(item.entry)
@@ -223,7 +224,7 @@ fun ThreadScreen(model: ThreadViewModel, alerts: Alerts, onBack: (() -> Unit)?) 
 }
 
 @Composable
-private fun Header(t: Task, pickable: Boolean, onPickModel: () -> Unit) {
+private fun Header(t: Task, caps: Map<String, Double>, pickable: Boolean, onPickModel: () -> Unit) {
     val p = LocalPalette.current
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp),
@@ -255,6 +256,10 @@ private fun Header(t: Task, pickable: Boolean, onPickModel: () -> Unit) {
                     if (pickable) Icon(Icons.Rounded.ExpandMore, "Change the model", tint = p.dewDeep, modifier = Modifier.size(14.dp))
                 }
             }
+        }
+        spendLine(t, caps)?.let { line ->
+            Spacer(Modifier.height(6.dp))
+            Text(line, style = Type.caption, color = p.inkSoft, textAlign = TextAlign.Center)
         }
         Spacer(Modifier.height(4.dp))
         Text(

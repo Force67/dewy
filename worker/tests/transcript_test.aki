@@ -11,7 +11,7 @@ import {lines} from akibase::strings::string_util;
 import {eprintln} from akibase::logging;
 import {Transcript} from worker::transcript;
 import {read_claude, read_terminal, claude_input} from worker::claude_code;
-import {read_codex} from worker::codex;
+import {read_codex, read_rollout} from worker::codex;
 import {read_opencode} from worker::opencode;
 
 comptime let kClaude: str = r"""
@@ -41,6 +41,28 @@ comptime let kOpenCode: str = r"""
 {"type":"step_finish","timestamp":1790777194430,"sessionID":"ses_f0d5","part":{"id":"prt_4","reason":"tool-calls","type":"step-finish"}}
 {"type":"text","timestamp":1790777197474,"sessionID":"ses_f0d5","part":{"id":"prt_5","type":"text","text":"hi"}}
 {"type":"error","timestamp":1790777205145,"sessionID":"ses_f0d5","error":{"name":"UnknownError","data":{"message":"Unexpected server error."}}}
+""";
+
+// A Claude message repeats its usage per block; `result` has the turn's.
+comptime let kClaudeSpend: str = r"""
+{"type":"assistant","message":{"id":"msg_1","content":[{"type":"thinking","thinking":""}],"usage":{"input_tokens":10,"cache_creation_input_tokens":9625,"cache_read_input_tokens":13541,"output_tokens":4}}}
+{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":9625,"cache_read_input_tokens":13541,"output_tokens":4}}}
+{"type":"assistant","message":{"id":"msg_2","content":[{"type":"text","text":"sub"}],"usage":{"input_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}}}
+{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"again"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":9625,"cache_read_input_tokens":13541,"output_tokens":4}}}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.0207991,"usage":{"input_tokens":10,"cache_creation_input_tokens":9625,"cache_read_input_tokens":13541,"output_tokens":37}}
+""";
+
+// A call's line, the same line again as Codex repeats it at times, and
+// the next call.
+comptime let kRollout: str = r"""
+{"timestamp":"2026-09-30T14:36:19.989Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000},"last_token_usage":{"total_tokens":400}},"rate_limits":{"primary":{"used_percent":73.0,"window_minutes":10080,"resets_at":1791143267},"plan_type":"prolite"}}}
+{"timestamp":"2026-09-30T14:36:20.000Z","type":"response_item","payload":{"type":"message"}}
+{"timestamp":"2026-09-30T14:36:21.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000},"last_token_usage":{"total_tokens":400}},"rate_limits":{"primary":{"used_percent":73.0,"window_minutes":10080,"resets_at":1791143267},"plan_type":"prolite"}}}
+{"timestamp":"2026-09-30T14:36:25.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1250},"last_token_usage":{"total_tokens":250}},"rate_limits":{"primary":{"used_percent":74.0,"window_minutes":10080,"resets_at":1791143267},"plan_type":"prolite"}}}
+""";
+
+comptime let kOpenCodeSpend: str = r"""
+{"type":"step_finish","timestamp":1790777187192,"sessionID":"ses_f0d5","part":{"id":"prt_4","reason":"tool-calls","type":"step-finish","tokens":{"total":10457,"input":8510,"output":27,"reasoning":0,"cache":{"write":0,"read":1920}},"cost":0.002}}
 """;
 
 // A terminal session's transcript: a typed prompt, injected context, a
@@ -147,6 +169,38 @@ pub fn main(): i32 {
   check(oe.len() == 8 && oe[7].as_str() == "{\"id\":\"t4.m1\",\"kind\":\"error\",\"text\":\"Unexpected server error.\"}",
         "opencode error", failures);
   check(oc.failed, "opencode error fails the turn", failures);
+
+  var cs = Transcript("t5", "");
+  let _ = run(kClaudeSpend, "claude", cs);
+  check(cs.tokens == 23213.0, "claude counts each message once, interleaved too, then what result adds", failures);
+  check(cs.cost > 0.02079 && cs.cost < 0.02081, "claude's cost comes with result", failures);
+  check(x.tokens == 33352.0, "codex without a rollout counts turn.completed", failures);
+  var xr = Transcript("t6", "");
+  xr.rollout = true;
+  var calls: u32 = 0;
+  for (let line in lines(kRollout)) {
+    if (let j = parse(line)) {
+      if (let m = read_rollout(xr, j)) {
+        calls += 1;
+        check(m.limits.len() == 1, "a rollout call carries the limits", failures);
+      }
+    }
+  }
+  check(calls == 3 && xr.tokens == 1250.0, "a new session counts its total, a repeated line once", failures);
+  let _ = run(kCodex, "codex", xr);
+  check(xr.tokens == 1250.0, "with a rollout, turn.completed adds nothing", failures);
+  var resumed = Transcript("t8", "01a0");
+  resumed.rollout = true;
+  resumed.codex_total = 900.0;
+  for (let line in lines(kRollout)) {
+    if (let j = parse(line)) {
+      let _ = read_rollout(resumed, j);
+    }
+  }
+  check(resumed.tokens == 350.0, "a resumed session counts from its total so far", failures);
+  var os = Transcript("t7", "");
+  let _ = run(kOpenCodeSpend, "opencode", os);
+  check(os.tokens == 10457.0 && os.cost > 0.00199 && os.cost < 0.00201, "opencode counts each step", failures);
 
   var w = Transcript("w", "bcef");
   let we = run(kTerminal, "terminal", w);

@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.dewy.net.Box as DewyBox
 import dev.dewy.net.Meter
+import dev.dewy.net.Task
 import dev.dewy.settings.ConnectionSettings
 import dev.dewy.ui.AgentMark
 import dev.dewy.ui.CardShape
@@ -274,4 +275,27 @@ fun until(millis: Long): String {
         m < 48 * 60 -> "${m / 60} h ${m % 60} min"
         else -> "${m / (24 * 60)} days ${(m % (24 * 60)) / 60} h"
     }
+}
+
+/**
+ * "184K tokens · $0.42 at API prices · ≈ 3% of 5 hours", or null before the
+ * task used anything. [caps] are the budgets of its opencode provider.
+ */
+fun spendLine(t: Task, caps: Map<String, Double>): String? {
+    val s = t.spend
+    if (s.tokens <= 0 && s.cost <= 0) return null
+    val parts = mutableListOf<String>()
+    if (s.tokens > 0) parts += "${compactTokens(s.tokens)} tokens"
+    if (s.cost > 0) parts += if (t.agent == "claude") "${dollars(s.cost)} at API prices" else dollars(s.cost)
+    s.share.filter { it.used >= 0.0005 }.forEach { parts += "≈ ${percent(it.used)} of ${it.name}" }
+    if (t.agent == "opencode") {
+        caps.forEach { (window, cap) -> if (cap > 0 && s.cost > 0) parts += "${percent(s.cost / cap)} of the budget for $window" }
+    }
+    return parts.joinToString(" · ")
+}
+
+/** 0.004 reads as "0.4%", 0.031 as "3%". */
+fun percent(fraction: Double): String {
+    val p = fraction * 100
+    return if (p < 9.95) "%.1f%%".format(p).replace(".0%", "%").replace(",0%", "%") else "%.0f%%".format(p)
 }

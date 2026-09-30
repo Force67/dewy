@@ -7,6 +7,12 @@ import {eprintln} from akibase::logging;
 import {str_of} from wire::fields;
 import {Board, Refusal, kStallMillis} from orchestrator::board;
 
+fn claude_usage(five: str, seven: str): String =>
+  f"{{\"type\":\"usage\",\"meters\":[{{\"agent\":\"claude\",\"provider\":\"anthropic\",\"limits\":[{{\"name\":\"5 hours\",\"used\":{five}}},{{\"name\":\"7 days\",\"used\":{seven}}}]}}]}}";
+
+fn claude_usage_at(five: str, seven: str, at: i32): String =>
+  f"{{\"type\":\"usage\",\"meters\":[{{\"agent\":\"claude\",\"provider\":\"anthropic\",\"at\":{at},\"limits\":[{{\"name\":\"5 hours\",\"used\":{five}}},{{\"name\":\"7 days\",\"used\":{seven}}}]}}]}}";
+
 fn check(ok: bool, what: str, var failures&: i32): () {
   if (!ok) {
     eprintln(what);
@@ -154,6 +160,51 @@ pub fn main(): i32 {
   var restored = Board();
   restored.restore_box(as_array(parse(lab.as_str())!)![1]);
   check(contains(to_string(restored.boxes_json()).as_str(), "\"used\":0.75"), "meters are saved with the box", failures);
+
+  // Spend: a rise of a limit is split among the tasks that used tokens
+  // since, by their tokens; each window on its own.
+  let big = b.create_task("forge", "/src/dewy", "claude", "", "big", none_images, false, 890000)!;
+  let small = b.create_task("forge", "/src/dewy", "claude", "", "small", none_images, false, 890000)!;
+  let _ = b.apply("forge", parse(claude_usage("0.10", "0.40").as_str())!, 890001);
+  let _ = b.apply("forge", parse(f"{{\"type\":\"spend\",\"task\":\"{big}\",\"provider\":\"anthropic\",\"tokens\":300,\"cost\":0.5}}".as_str())!, 890002);
+  let _ = b.apply("forge", parse(f"{{\"type\":\"spend\",\"task\":\"{small}\",\"provider\":\"anthropic\",\"tokens\":100,\"cost\":0}}".as_str())!, 890003);
+  let _ = b.apply("forge", parse(claude_usage("0.14", "0.40").as_str())!, 890004);
+  let big_json = to_string(b.task_json(big.as_str())!);
+  check(contains(big_json.as_str(), "\"spend\":{\"tokens\":300,\"cost\":0.5,\"share\":[{\"name\":\"5 hours\",\"used\":0.03"),
+        "the big task gets three quarters of the rise", failures);
+  check(contains(to_string(b.task_json(small.as_str())!).as_str(), "{\"name\":\"5 hours\",\"used\":0.01"),
+        "the small task a quarter", failures);
+  let _ = b.apply("forge", parse(claude_usage("0.14", "0.44").as_str())!, 890005);
+  check(contains(to_string(b.task_json(big.as_str())!).as_str(), "{\"name\":\"7 days\",\"used\":0.03"),
+        "the week rose later, on the same tokens", failures);
+  let _ = b.apply("forge", parse(f"{{\"type\":\"spend\",\"task\":\"{small}\",\"provider\":\"anthropic\",\"tokens\":50,\"cost\":0}}".as_str())!, 890006);
+  let _ = b.apply("forge", parse(claude_usage("0.02", "0.44").as_str())!, 890007);
+  let _ = b.apply("forge", parse(claude_usage("0.05", "0.44").as_str())!, 890008);
+  check(!contains(to_string(b.task_json(small.as_str())!).as_str(), "{\"name\":\"5 hours\",\"used\":0.04"),
+        "a new window forgets the tokens before it", failures);
+  let _ = b.apply("lab", parse(f"{{\"type\":\"spend\",\"task\":\"{big}\",\"provider\":\"anthropic\",\"tokens\":999,\"cost\":9}}".as_str())!, 890009);
+  check(contains(to_string(b.task_json(big.as_str())!).as_str(), "\"tokens\":300,"), "another box cannot add to a task", failures);
+
+  // A reading older than the known one changes nothing: no reset, no rise.
+  let _ = b.apply("forge", parse(f"{{\"type\":\"spend\",\"task\":\"{big}\",\"provider\":\"anthropic\",\"tokens\":10,\"cost\":0}}".as_str())!, 890010);
+  let _ = b.apply("forge", parse(claude_usage_at("0.05", "0.44", 20).as_str())!, 890011);
+  let _ = b.apply("forge", parse(claude_usage_at("0.01", "0.44", 10).as_str())!, 890012);
+  let _ = b.apply("forge", parse(claude_usage_at("0.07", "0.44", 30).as_str())!, 890013);
+  check(contains(to_string(b.task_json(big.as_str())!).as_str(), "{\"name\":\"5 hours\",\"used\":0.05"),
+        "a stale reading is not a reset", failures);
+  check(contains(to_string(b.boxes_json()).as_str(), "\"used\":0.07"), "the newest reading stays", failures);
+
+  // After a hello, the first reading is a baseline: the rise before it
+  // happened while the box was away.
+  let _ = b.attach(hello, 890014);
+  let _ = b.apply("forge", parse(f"{{\"type\":\"spend\",\"task\":\"{big}\",\"provider\":\"anthropic\",\"tokens\":10,\"cost\":0}}".as_str())!, 890015);
+  let _ = b.apply("forge", parse(claude_usage_at("0.50", "0.60", 40).as_str())!, 890016);
+  check(!contains(to_string(b.task_json(big.as_str())!).as_str(), "{\"name\":\"7 days\",\"used\":0.19"),
+        "the first reading after a hello is a baseline", failures);
+
+  var saved = Board();
+  saved.restore_task(b.task_json(big.as_str())!);
+  check(contains(to_string(saved.task_json(big.as_str())!).as_str(), "\"tokens\":320,\"cost\":0.5"), "spend is saved", failures);
 
   b.detach("forge", 900000);
   check(!contains(to_string(b.boxes_json()).as_str(), "rx-de"), "an offline box lists no sessions", failures);

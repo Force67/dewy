@@ -105,6 +105,10 @@ pub fn read_opencode(var t&: Transcript, line&: Json): Vector<Json> {
       }
       out.push(tool_finished(id.as_str(), ok, str_of(state, "output") ?? ""));
     }
+  } else if (kind == "step_finish") {
+    if (let part = get(line, "part")) {
+      t.spend(num_of(path(part, "tokens") ?? Json::Null, "total") ?? 0.0, num_of(part, "cost") ?? 0.0);
+    }
   } else if (kind == "error") {
     t.failed = true;
     var why = "opencode failed.";

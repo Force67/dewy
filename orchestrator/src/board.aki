@@ -72,6 +72,12 @@ pub struct Task : Send {
   pub var created: i64
   pub var updated: i64
   pub var turns: u32
+  // What its turns used, as the worker reported it, and its estimated
+  // share of each limit as JSON text: [{"name", "used"}] (see
+  // docs/adr/0006-task-usage.md).
+  pub var tokens: f64
+  pub var cost: f64
+  pub var share: String
   // Entries as JSON text, since akibase's Json is not Send, and their ids.
   pub var entries: Vector<String>
   pub var entry_ids: Vector<String>
@@ -97,6 +103,19 @@ pub struct Box : Send {
   pub var last_seen: i64
   // Lines for the box's worker, oldest first.
   pub var outbox: Vector<String>
+  // Providers with a meter since the worker's hello. The first one after
+  // it is only a baseline: the rise since the one before happened unseen.
+  pub var measured: Vector<String>
+}
+
+// Tokens a task used against one limit window of a box's provider since
+// that window last rose.
+struct Pending : Send {
+  pub var box_name: String
+  pub var provider: String
+  pub var window: String
+  pub var task: String
+  pub var tokens: f64
 }
 
 struct Change : Send {
@@ -112,6 +131,7 @@ pub struct Board : Send {
   var next_id: u64
   var dirty_tasks: Vector<String>
   var dirty_boxes: bool
+  var pending: Vector<Pending>
 
   pub fn Board(): Board;
   pub fn last_seq(self&): u64;
@@ -143,12 +163,15 @@ pub struct Board : Send {
   fn set_state(var self&, i: usize, state: TaskState, now: i64): ();
   fn emit(var self&, kind: str, data&: Json): ();
   fn touch_task(var self&, i: usize): ();
+  fn spend(var self&, box_name: str, msg&: Json): ();
+  fn attribute(var self&, box_name: str, fresh&: Json): ();
   fn touch_box(var self&, b: usize): ();
 }
 
 fn Board::Board(): Board => Board {
   tasks: new::<Task>(), boxes: new::<Box>(), feed: Deque::<Change>(Heap {}), seq: 0, next_id: 1,
-  dirty_tasks: new::<String>(), dirty_boxes: false
+  dirty_tasks: new::<String>(), dirty_boxes: false,
+  pending: new::<Pending>()
 };
 
 fn Board::last_seq(self&): u64 => self.seq;
@@ -219,8 +242,8 @@ fn Board::create_task(var self&, box_name: str, project: str, agent: str, model:
   self.tasks.push(Task {
     id: id.clone(), box_name: from_str(box_name), project: from_str(project), agent: from_str(agent), model: from_str(model),
     title, session: String(), preview: String(), activity: String(),
-    state: TaskState::Working, archived: false, yolo, created: now, updated: now, turns: 0, entries: new::<String>(),
-    entry_ids: new::<String>()
+    state: TaskState::Working, archived: false, yolo, created: now, updated: now, turns: 0, tokens: 0.0, cost: 0.0,
+    share: from_str("[]"), entries: new::<String>(), entry_ids: new::<String>()
   });
   self.send_turn(self.tasks.len() - 1, prompt, images, now);
   return id;
@@ -272,7 +295,7 @@ fn Board::attach_session(var self&, box_name: str, session: str, yolo: bool, now
     id: id.clone(), box_name: from_str(box_name), project: string_of(s, "project"), agent: from_str("claude"),
     model: String(), title, session: from_str(session), preview: String(), activity: String(),
     state: working ? TaskState::Working : TaskState::Idle, archived: false, yolo, created: now, updated: now, turns: 0,
-    entries: new::<String>(), entry_ids: new::<String>()
+    tokens: 0.0, cost: 0.0, share: from_str("[]"), entries: new::<String>(), entry_ids: new::<String>()
   });
   self.touch_task(self.tasks.len() - 1);
   set(watch, "task", text(id.as_str()));
@@ -382,6 +405,153 @@ fn Board::set_model(var self&, id: str, model: str, now: i64): () ! Refusal {
   return ();
 }
 
+// A worker's report of what a task used: it adds to the task, and waits as
+// pending tokens for the next rise of each limit its provider has on the box.
+fn Board::spend(var self&, box_name: str, msg&: Json): () {
+  let i = self.find_task(str_of(msg, "task") ?? "") else {
+    return;
+  };
+  if (self.tasks[i].box_name.as_str() != box_name) {
+    return;
+  }
+  let tokens = num_of(msg, "tokens") ?? 0.0;
+  self.tasks[i].tokens += tokens;
+  self.tasks[i].cost += num_of(msg, "cost") ?? 0.0;
+  self.touch_task(i);
+  let provider = str_of(msg, "provider") ?? "";
+  let b = self.find_box(box_name) else {
+    return;
+  };
+  if (#provider == 0 || tokens <= 0.0) {
+    return;
+  }
+  let meters = as_array(parse(self.boxes[b].usage.as_str()) ?? Json::Null) else {
+    return;
+  };
+  for (let m& in meters) {
+    if ((str_of(m, "provider") ?? "") != provider) {
+      continue;
+    }
+    for (let l& in as_array(get(m, "limits") ?? Json::Null) ?? []) {
+      let window = str_of(l, "name") ?? "";
+      var found = false;
+      for (var p& in self.pending) {
+        if (p.box_name.as_str() == box_name && p.provider.as_str() == provider && p.window.as_str() == window
+            && p.task.eq(self.tasks[i].id)) {
+          p.tokens += tokens;
+          found = true;
+        }
+      }
+      if (!found) {
+        self.pending.push(Pending {
+          box_name: from_str(box_name), provider: from_str(provider), window: from_str(window),
+          task: self.tasks[i].id.clone(), tokens
+        });
+      }
+    }
+  }
+}
+
+// Splits every rise of a limit, from the box's meters to the fresh ones,
+// among the tasks with pending tokens for it; a fall is a new window.
+fn Board::attribute(var self&, box_name: str, fresh&: Json): () {
+  let b = self.find_box(box_name) else {
+    return;
+  };
+  let known = parse(self.boxes[b].usage.as_str()) ?? Json::Null;
+  for (let f& in as_array(get(fresh, "meters") ?? Json::Null) ?? []) {
+    let provider = str_of(f, "provider") ?? "";
+    var baselined = false;
+    for (let p& in self.boxes[b].measured) {
+      if (p.as_str() == provider) {
+        baselined = true;
+      }
+    }
+    if (!baselined) {
+      self.boxes[b].measured.push(from_str(provider));
+      continue;
+    }
+    for (let old& in as_array(known) ?? []) {
+      // An older reading than the one known says nothing new.
+      if (!same_meter(old, f) || (num_of(f, "at") ?? 0.0) < (num_of(old, "at") ?? 0.0)) {
+        continue;
+      }
+      for (let l& in as_array(get(f, "limits") ?? Json::Null) ?? []) {
+        let window = str_of(l, "name") ?? "";
+        let before = limit_used(old, window) else {
+          continue;
+        };
+        let rise = (num_of(l, "used") ?? 0.0) - before;
+        if (rise > 1e-9) {
+          var total: f64 = 0.0;
+          for (let p& in self.pending) {
+            if (p.box_name.as_str() == box_name && p.provider.as_str() == provider && p.window.as_str() == window) {
+              total += p.tokens;
+            }
+          }
+          var shares = new::<(String, f64)>();
+          for (let p& in self.pending) {
+            if (total > 0.0 && p.box_name.as_str() == box_name && p.provider.as_str() == provider
+                && p.window.as_str() == window) {
+              shares.push((p.task.clone(), rise * p.tokens / total));
+            }
+          }
+          for (let sh& in shares) {
+            if (let i = self.find_task(sh.0.as_str())) {
+              self.tasks[i].share = add_share(self.tasks[i].share.as_str(), window, sh.1);
+              self.touch_task(i);
+            }
+          }
+        }
+        if (rise > 1e-9 || rise < -1e-9) {
+          var k: usize = 0;
+          while (k < self.pending.len()) {
+            let p& = self.pending[k];
+            if (p.box_name.as_str() == box_name && p.provider.as_str() == provider && p.window.as_str() == window) {
+              let _ = self.pending.remove(k);
+            } else {
+              k += 1;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn limit_used(meter&: Json, window: str): f64? {
+  for (let l& in as_array(get(meter, "limits") ?? Json::Null) ?? []) {
+    if ((str_of(l, "name") ?? "") == window) {
+      return num_of(l, "used");
+    }
+  }
+  return none;
+}
+
+// A task's shares with `amount` more of `window`.
+fn add_share(known: str, window: str, amount: f64): String {
+  var out = array();
+  var found = false;
+  for (let s& in as_array(parse(known) ?? Json::Null) ?? []) {
+    var used = num_of(s, "used") ?? 0.0;
+    if ((str_of(s, "name") ?? "") == window) {
+      used += amount;
+      found = true;
+    }
+    var o = object();
+    set(o, "name", text(str_of(s, "name") ?? ""));
+    set(o, "used", number(used));
+    push(out, o);
+  }
+  if (!found) {
+    var o = object();
+    set(o, "name", text(window));
+    set(o, "used", number(amount));
+    push(out, o);
+  }
+  return to_string(out);
+}
+
 fn same_meter(a&: Json, b&: Json): bool =>
   (str_of(a, "agent") ?? "") == (str_of(b, "agent") ?? "") && (str_of(a, "provider") ?? "") == (str_of(b, "provider") ?? "");
 
@@ -396,7 +566,7 @@ fn merge_meters(known: str, msg&: Json): String {
     for (let m& in old) {
       var replaced = false;
       for (let f& in fresh) {
-        if (same_meter(m, f)) {
+        if (same_meter(m, f) && (num_of(f, "at") ?? 0.0) >= (num_of(m, "at") ?? 0.0)) {
           replaced = true;
         }
       }
@@ -406,7 +576,17 @@ fn merge_meters(known: str, msg&: Json): String {
     }
   }
   for (let f& in fresh) {
-    push(out, copy(f));
+    var older = false;
+    if (let old = as_array(parse(known) ?? Json::Null)) {
+      for (let m& in old) {
+        if (same_meter(m, f) && (num_of(f, "at") ?? 0.0) < (num_of(m, "at") ?? 0.0)) {
+          older = true;
+        }
+      }
+    }
+    if (!older) {
+      push(out, copy(f));
+    }
   }
   return to_string(out);
 }
@@ -457,7 +637,8 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   if (b == self.boxes.len()) {
     self.boxes.push(Box {
       name: from_str(name), host: String(), os: String(), agents: from_str("[]"), projects: from_str("[]"),
-      models: from_str("{}"), usage: from_str("[]"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>()
+      models: from_str("{}"), usage: from_str("[]"), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: now, outbox: new::<String>(),
+      measured: new::<String>()
     });
   }
   self.boxes[b].host = string_of(hello, "host");
@@ -467,6 +648,7 @@ fn Board::attach(var self&, hello&: Json, now: i64): String {
   self.boxes[b].models = models_text(hello);
   self.boxes[b].sessions = from_str("[]");
   self.boxes[b].online = true;
+  self.boxes[b].measured = new::<String>();
   self.boxes[b].last_seen = now;
   self.touch_box(b);
 
@@ -501,8 +683,13 @@ fn Board::detach(var self&, name: str, now: i64): () {
 // the box's stats.
 fn Board::apply(var self&, box_name: str, msg&: Json, now: i64): () {
   let kind = str_of(msg, "type") ?? "";
+  if (kind == "spend") {
+    self.spend(box_name, msg);
+    return;
+  }
   if (kind == "usage") {
     if (let b = self.find_box(box_name)) {
+      self.attribute(box_name, msg);
       self.boxes[b].usage = merge_meters(self.boxes[b].usage.as_str(), msg);
       self.touch_box(b);
     }
@@ -704,6 +891,11 @@ fn summary_json(t&: Task): Json {
   set(o, "created", number(t.created as f64));
   set(o, "updated", number(t.updated as f64));
   set(o, "turns", number(t.turns as f64));
+  var spend = object();
+  set(spend, "tokens", number(t.tokens));
+  set(spend, "cost", number(t.cost));
+  set(spend, "share", parse(t.share.as_str()) ?? array());
+  set(o, "spend", spend);
   return o;
 }
 
@@ -775,12 +967,22 @@ fn Board::restore_task(var self&, j&: Json): () {
       entry_ids.push(string_of(e, "id"));
     }
   }
+  var tokens: f64 = 0.0;
+  var cost: f64 = 0.0;
+  var share = from_str("[]");
+  if (let spent = get(j, "spend")) {
+    tokens = num_of(spent, "tokens") ?? 0.0;
+    cost = num_of(spent, "cost") ?? 0.0;
+    if (let list = get(spent, "share")) {
+      share = to_string(copy(list));
+    }
+  }
   self.tasks.push(Task {
     id, box_name: string_of(j, "box"), project: string_of(j, "project"), agent: string_of(j, "agent"),
     model: string_of(j, "model"), title: string_of(j, "title"), session: string_of(j, "session"), preview: string_of(j, "preview"),
     activity: String(), state, archived: bool_of(j, "archived") ?? false, yolo: bool_of(j, "yolo") ?? false,
     created: (num_of(j, "created") ?? 0.0) as i64, updated: (num_of(j, "updated") ?? 0.0) as i64,
-    turns: (num_of(j, "turns") ?? 0.0) as u32, entries, entry_ids
+    turns: (num_of(j, "turns") ?? 0.0) as u32, tokens, cost, share, entries, entry_ids
   });
 }
 
@@ -789,7 +991,7 @@ fn Board::restore_box(var self&, j&: Json): () {
     name: string_of(j, "name"), host: string_of(j, "host"), os: string_of(j, "os"),
     agents: to_string(get(j, "agents") ?? Json::Null), projects: to_string(get(j, "projects") ?? Json::Null),
     models: models_text(j), usage: usage_text(j), stats: from_str("{}"), sessions: from_str("[]"), online: false, last_seen: (num_of(j, "lastSeen") ?? 0.0) as i64,
-    outbox: new::<String>()
+    outbox: new::<String>(), measured: new::<String>()
   });
 }
 

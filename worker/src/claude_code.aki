@@ -8,12 +8,17 @@ import {String, from_str} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
 import {Command} from akibase::process::child;
 import {Json, object, array, set, push, text, to_string, get, as_array, as_str, path} from akibase::text::json;
-import {str_of, bool_of} from wire::fields;
+import {str_of, num_of, bool_of} from wire::fields;
 import {first_line} from wire::clip;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 import {claude_meter} from worker::usage;
 import {unix_time_milliseconds} from akibase::time::time;
+
+// Every token a Claude usage counts, cached ones included.
+fn usage_tokens(u&: Json): f64 =>
+  (num_of(u, "input_tokens") ?? 0.0) + (num_of(u, "cache_creation_input_tokens") ?? 0.0)
+    + (num_of(u, "cache_read_input_tokens") ?? 0.0) + (num_of(u, "output_tokens") ?? 0.0);
 
 // With `on_stdin`, the prompt comes as a stream-json user message on
 // standard input, which is how images reach Claude.
@@ -48,6 +53,20 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
   if (let s = str_of(line, "session_id")) {
     t.session = from_str(s);
   }
+  if (kind == "assistant") {
+    if (let id = str_of(get(line, "message") ?? Json::Null, "id")) {
+      var seen = false;
+      for (let m& in t.messages) {
+        if (m.as_str() == id) {
+          seen = true;
+        }
+      }
+      if (!seen) {
+        t.messages.push(from_str(id));
+        t.spend(usage_tokens(path(line, "message.usage") ?? Json::Null), 0.0);
+      }
+    }
+  }
   if (kind == "assistant" || kind == "user") {
     let blocks = as_array(path(line, "message.content") ?? Json::Null) else {
       return out;
@@ -76,6 +95,9 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
       t.usage = to_string(m.to_json());
     }
   } else if (kind == "result") {
+    let counted = t.turn_tokens;
+    let total = usage_tokens(get(line, "usage") ?? Json::Null);
+    t.spend(total > counted ? total - counted : 0.0, num_of(line, "total_cost_usd") ?? 0.0);
     if (bool_of(line, "is_error") ?? false) {
       t.failed = true;
       let why = str_of(line, "result") ?? "Claude stopped with an error.";

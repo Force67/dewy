@@ -7,7 +7,7 @@ module worker::turn;
 import {String, from_str, with_nul} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
 import {spawn_error_message, exit_code} from akibase::process::child;
-import {Json, parse, object, array, push, set, text, to_string} from akibase::text::json;
+import {Json, parse, object, array, push, set, text, number, to_string} from akibase::text::json;
 import {SharedPointer} from akibase::memory::shared_pointer;
 import {Mutex} from akibase::threading::mutex;
 import {Atomic} from akibase::atomic;
@@ -17,14 +17,15 @@ import {write_bytes} from wire::files;
 import {temp_directory} from akibase::filesystem::common_directory_providers;
 import {join} from akibase::filesystem::path;
 import {system_now} from akibase::time::time;
-import {trim} from akibase::strings::string_search;
+import {trim, find} from akibase::strings::string_search;
 import {clip} from wire::clip;
 import {said, entry_message} from worker::entry;
 import {usage_message} from worker::usage;
 import {Transcript} from worker::transcript;
 import {make_fifo} from worker::fifo;
 import {claude_command, claude_input, read_claude} from worker::claude_code;
-import {codex_command, read_codex} from worker::codex;
+import {codex_command, read_codex, read_rollout, rollout_of, last_total} from worker::codex;
+import {Tail, open_tail} from worker::tail;
 import {opencode_command, read_opencode} from worker::opencode;
 import {find_session, end_session} from worker::terminal;
 
@@ -256,6 +257,9 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
   };
   job.pid.get().store(child.id());
   var session = o.session.clone();
+  let provider = provider_of(o);
+  var rollout: Tail? = none;
+  var lookups: u32 = 0;
   fifo.block();
   while (let line = fifo.read_line()) {
     let j = parse(line.as_str()) else {
@@ -280,7 +284,31 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
     while (list.len() > 0) {
       post(job.outbox, entry_message(task, list.remove(0)));
     }
+    if (o.agent == Agent::Codex) {
+      // The rollout exists once Codex names the session; an old session
+      // outside the newest days is not worth a search per line.
+      if (rollout == none && !session.is_empty() && lookups < 5) {
+        lookups += 1;
+        if (let path = rollout_of(session.as_str())) {
+          if (let opened = open_tail(path.as_str())) {
+            var r = opened;
+            // A resumed session's earlier turns are counted already: start
+            // from its total so far. A new one is read from its start.
+            if (!o.session.is_empty()) {
+              t.codex_total = last_total(path.as_str());
+              r.skip_to_end();
+            }
+            rollout = r;
+            t.rollout = true;
+          }
+        }
+      }
+      follow(rollout, t, job, provider.as_str());
+    }
+    post_spend(job, t, provider.as_str());
   }
+  follow(rollout, t, job, provider.as_str());
+  post_spend(job, t, provider.as_str());
   let status = child.wait();
   job.pid.get().store(0);
   if (exit_code(status) == 0) {
@@ -298,4 +326,44 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
     post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", why.as_str())));
   }
   return false;
+}
+
+// Who the turn's tokens count against: opencode's is its model's provider,
+// unknown for the default model.
+fn provider_of(o&: TurnOrder): String => match (o.agent) {
+  Agent::Claude => from_str("anthropic"),
+  Agent::Codex => from_str("openai"),
+  Agent::OpenCode => from_str(o.model.as_str()[..(find(o.model.as_str(), "/") ?? 0)]),
+};
+
+// Reads what Codex's rollout gained: its calls' tokens, then the limits
+// after them, so the orchestrator has the tokens when the limits rise.
+fn follow(var rollout&: Tail?, var t&: Transcript, job&: TurnJob, provider: str): () {
+  if (var r& = rollout) {
+    while (let line = r.next_line()) {
+      if (let j = parse(line.as_str())) {
+        if (let m = read_rollout(t, j)) {
+          post_spend(job, t, provider);
+          var meters = array();
+          push(meters, m.to_json());
+          post(job.outbox, usage_message(meters));
+        }
+      }
+    }
+  }
+}
+
+fn post_spend(job&: TurnJob, var t&: Transcript, provider: str): () {
+  if (t.tokens <= 0.0 && t.cost <= 0.0) {
+    return;
+  }
+  var m = object();
+  set(m, "type", text("spend"));
+  set(m, "task", text(job.order.task.as_str()));
+  set(m, "provider", text(provider));
+  set(m, "tokens", number(t.tokens));
+  set(m, "cost", number(t.cost));
+  post(job.outbox, m);
+  t.tokens = 0.0;
+  t.cost = 0.0;
 }

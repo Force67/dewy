@@ -12,6 +12,7 @@ import {utf8_lossy} from akibase::text::code_convert;
 extern("open") fn c_open(path: *const c8, flags: i32): i32;
 extern("read") fn c_read(fd: i32, p: *var u8, n: usize): i64;
 extern("close") fn c_close(fd: i32): i32;
+extern("lseek") fn c_lseek(fd: i32, offset: i64, whence: i32): i64;
 
 comptime let kReadOnly: i32 = 0;
 
@@ -22,6 +23,7 @@ pub struct Tail : Drop, Send {
 
   fn Tail(fd: i32): Tail;
   pub fn next_line(var self&): String?;
+  pub fn skip_to_end(var self&): ();
   pub fn drop(var self&): ();
 }
 
@@ -38,6 +40,15 @@ pub fn open_tail(path: str): Tail? {
 }
 
 fn Tail::Tail(fd: i32): Tail => Tail { fd, buf: new::<u8>(), head: 0 };
+
+// Skips what the file holds so far.
+fn Tail::skip_to_end(var self&): () {
+  unsafe {
+    let _ = c_lseek(self.fd, 0, 2);
+  }
+  self.buf = new::<u8>();
+  self.head = 0;
+}
 
 // The next whole line without its newline, or none until more is written.
 // A line still being written stays buffered.
@@ -79,4 +90,36 @@ fn Tail::drop(var self&): () {
       let _ = c_close(self.fd);
     }
   }
+}
+
+// The last `n` bytes of a file, read rather than mapped: a mapped file
+// that shrinks kills the process.
+pub fn last_bytes(path: str, n: usize): Vector<u8>? {
+  let c = with_nul(path);
+  var fd: i32 = -1;
+  unsafe {
+    fd = c_open(@ptr(c.as_str()), kReadOnly);
+  }
+  if (fd < 0) {
+    return none;
+  }
+  var out = new::<u8>();
+  var chunk = [0u8; 65536];
+  unsafe {
+    let size = c_lseek(fd, 0, 2);
+    let start = size > n as i64 ? size - n as i64 : 0;
+    if (size >= 0 && c_lseek(fd, start, 0) >= 0) {
+      while (true) {
+        let got = c_read(fd, @ptr(chunk), 65536);
+        if (got <= 0) {
+          break;
+        }
+        for (let i in 0usize..got as usize) {
+          out.push(chunk[i]);
+        }
+      }
+    }
+    let _ = c_close(fd);
+  }
+  return out;
 }

@@ -228,7 +228,8 @@ private class Screens(
             )
             is Route.Thread -> {
                 val model = viewModel(key = route.taskId) { ThreadViewModel(route.taskId, store, readMarks, context) }
-                ThreadScreen(model, alerts, onBack)
+                val budgets by settings.budgets.collectAsStateWithLifecycle(emptyMap())
+                ThreadScreen(model, alerts, budgets, onBack)
             }
             is Route.BoxInfo -> BoxScreen(
                 box = board.boxes.find { it.name == route.name },

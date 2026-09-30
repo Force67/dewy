@@ -7,7 +7,16 @@ module worker::codex;
 import {String, from_str} from akibase::strings::base_string;
 import {Vector, new} from akibase::containers::vector;
 import {Command} from akibase::process::child;
-import {Json, get, as_array} from akibase::text::json;
+import {Json, get, as_array, path, parse} from akibase::text::json;
+import {last_bytes} from worker::tail;
+import {utf8_lossy} from akibase::text::code_convert;
+import {lines} from akibase::strings::string_util;
+import {Meter, codex_meter} from worker::usage;
+import {list_directory} from akibase::filesystem::directory;
+import {join} from akibase::filesystem::path;
+import {get_environment_variable} from akibase::environment_variables;
+import {ends_with, starts_with} from akibase::strings::string_search;
+import {sort} from akibase::algorithm;
 import {str_of, num_of} from wire::fields;
 import {find} from akibase::strings::string_search;
 import {said, tool_started, tool_finished} from worker::entry;
@@ -43,6 +52,13 @@ pub fn read_codex(var t&: Transcript, line&: Json): Vector<Json> {
   let kind = str_of(line, "type") ?? "";
   if (kind == "thread.started") {
     t.session = from_str(str_of(line, "thread_id") ?? "");
+  } else if (kind == "turn.completed") {
+    // What the rollout did not already count.
+    if (!t.rollout) {
+      if (let u = get(line, "usage")) {
+        t.spend((num_of(u, "input_tokens") ?? 0.0) + (num_of(u, "output_tokens") ?? 0.0), 0.0);
+      }
+    }
   } else if (kind == "turn.failed" || kind == "error") {
     t.failed = true;
     let nested = get(line, "error");
@@ -111,6 +127,96 @@ fn changed_paths(item&: Json): String {
         out.push_str(", ");
       }
       out.push_str(str_of(c, "path") ?? "");
+    }
+  }
+  return out;
+}
+
+// The session's running token total a rollout line reports.
+fn rollout_total(line&: Json): f64? {
+  if ((str_of(get(line, "payload") ?? Json::Null, "type") ?? "") != "token_count") {
+    return none;
+  }
+  return num_of(path(line, "payload.info.total_token_usage") ?? Json::Null, "total_tokens");
+}
+
+// A line of the session's rollout: the tokens its total grew by, and the
+// account's limits after it, as a meter. Codex repeats a call's line at
+// times, which the total does not count twice.
+pub fn read_rollout(var t&: Transcript, line&: Json): Meter? {
+  let total = rollout_total(line) else {
+    return none;
+  };
+  if (total > t.codex_total) {
+    t.spend(total - t.codex_total, 0.0);
+    t.codex_total = total;
+  }
+  return codex_meter(line);
+}
+
+// The running total a rollout reached so far, from its last lines.
+pub fn last_total(file: str): f64 {
+  let bytes = last_bytes(file, 1 << 20) else {
+    return 0.0;
+  };
+  let text = utf8_lossy(bytes.as_slice());
+  var total: f64 = 0.0;
+  for (let line in lines(text.as_str())) {
+    if (let j = parse(line)) {
+      if (let n = rollout_total(j)) {
+        total = n;
+      }
+    }
+  }
+  return total;
+}
+
+fn sorted_names(dir: str): Vector<String> {
+  var names = list_directory(dir) ?? new::<String>();
+  sort(names.as_slice_var());
+  return names;
+}
+
+// The newest `count` rollout files by name, newest first. Their names
+// start with the time the session began.
+pub fn newest_rollouts(count: usize): Vector<String> => rollouts(count, "");
+
+// A session's rollout, among the newest files.
+pub fn rollout_of(session: str): String? {
+  var suffix = from_str(session);
+  suffix.push_str(".jsonl");
+  var found = rollouts(1, suffix.as_str());
+  if (found.is_empty()) {
+    return none;
+  }
+  return found.pop();
+}
+
+// The newest `count` rollouts ending in `suffix`, looking through the
+// newest three days that have sessions.
+fn rollouts(count: usize, suffix: str): Vector<String> {
+  var root = get_environment_variable("CODEX_HOME") ?? join((get_environment_variable("HOME") ?? String()).as_str(), ".codex");
+  let sessions = join(root.as_str(), "sessions");
+  var out = new::<String>();
+  var looked: usize = 0;
+  var years = sorted_names(sessions.as_str());
+  while (years.len() > 0 && out.len() < count) {
+    let y = join(sessions.as_str(), years.pop()!.as_str());
+    var months = sorted_names(y.as_str());
+    while (months.len() > 0 && out.len() < count) {
+      let m = join(y.as_str(), months.pop()!.as_str());
+      var days = sorted_names(m.as_str());
+      while (days.len() > 0 && out.len() < count && looked < 3) {
+        looked += 1;
+        let d = join(m.as_str(), days.pop()!.as_str());
+        var files = sorted_names(d.as_str());
+        while (files.len() > 0 && out.len() < count) {
+          let f = files.pop()!;
+          if (starts_with(f.as_str(), "rollout-") && ends_with(f.as_str(), ".jsonl") && ends_with(f.as_str(), suffix)) {
+            out.push(join(d.as_str(), f.as_str()));
+          }
+        }
+      }
     }
   }
   return out;

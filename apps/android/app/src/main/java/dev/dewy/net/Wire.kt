@@ -49,9 +49,27 @@ data class Task(
     val created: Long,
     val updated: Long,
     val turns: Int = 0,
+    val spend: TaskSpend = TaskSpend(),
 ) {
     val projectName get() = project.trimEnd('/').substringAfterLast('/')
+
+    /** Whose limits its tokens count against; unknown for opencode's default model. */
+    val provider get() = when (agent) {
+        "claude" -> "anthropic"
+        "codex" -> "openai"
+        else -> model.substringBefore('/', "")
+    }
 }
+
+/**
+ * What a task used, as its agent reported it, and its estimated share of
+ * each limit window (see docs/adr/0006-task-usage.md).
+ */
+@Serializable
+data class TaskSpend(val tokens: Double = 0.0, val cost: Double = 0.0, val share: List<Share> = emptyList())
+
+@Serializable
+data class Share(val name: String = "", val used: Double = 0.0)
 
 @Serializable
 data class Project(val name: String, val path: String)
