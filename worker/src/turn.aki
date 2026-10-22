@@ -22,7 +22,7 @@ import {clip} from wire::clip;
 import {said, entry_message} from worker::entry;
 import {usage_message} from worker::usage;
 import {Transcript} from worker::transcript;
-import {run_dir, stop_path} from worker::store;
+import {run_dir, stop_path, cancellation_path} from worker::store;
 import {atomic_write} from wire::files;
 import {socket_path, session_name, launch, exists, result, close_session, abandon} from worker::tmux;
 import {claude_command, claude_input, read_claude} from worker::claude_code;
@@ -252,7 +252,7 @@ fn run_agent(job&: TurnJob, dir: str, out_path: str, err_path: str, images&: [St
     let _ = write_file(out_path, "");
     if (job.stopped.get().load() != 0) { return false; }
     if (!launch(socket, name, dir, o.project, on_stdin ? images[0].as_str() : "/dev/null",
-                stop_path(o.record).as_str(), cmd)) {
+                o.record, cancellation_path(job.data_dir, task), cmd)) {
       post(job.outbox, entry_message(task, said(t.id_for("launch").as_str(), "error", "Could not start the agent in tmux.")));
       return false;
     }

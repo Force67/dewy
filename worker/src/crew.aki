@@ -21,7 +21,7 @@ import {find_session} from worker::terminal;
 import {WatchJob, watch_session} from worker::watch;
 import {read_file} from akikit::filesystem::file_util;
 import {parse} from akikit::text::json;
-import {save_order, resolve_order, orders, stop_path, forget} from worker::store;
+import {save_order, resolve_order, orders, stop_path, forget, persist_stop, recover_stops, clear_stops} from worker::store;
 import {atomic_write} from wire::files;
 
 struct Running {
@@ -48,7 +48,7 @@ pub struct Crew {
   var delivered: List<String> = List()
 
   pub fn Crew(yolo: bool, data_dir: str): Crew;
-  pub fn recover(var self&);
+  pub fn recover(var self&): bool;
   pub fn sent(var self&);
   fn accept(var self&, msg&: Json, record: str);
   pub fn order(var self&, msg&: Json);
@@ -113,12 +113,14 @@ fn Crew::order(var self&, msg&: Json) {
 }
 
 // Recovered orders enter the same per-task queue as new messages.
-fn Crew::recover(var self&) {
+fn Crew::recover(var self&): bool {
+  if (!recover_stops(self.data_dir)) { return false; }
   for (let path in orders(self.data_dir)) {
     if (let body = read_file(path)) {
       if (let msg = parse(body)) { self.accept(msg, path); }
     }
   }
+  return true;
 }
 
 fn Crew::accept(var self&, msg&: Json, record: str) {
@@ -187,6 +189,23 @@ fn Crew::watch(var self&, task: str, session: str) {
 }
 
 fn Crew::stop(var self&, task: str) {
+  var records = List::<String>();
+  for (let running in self.running) {
+    if (running.task == task && !running.record.is_empty()) { records.push(running.record.clone()); }
+  }
+  for (let order in self.waiting) {
+    if (order.task == task) { records.push(order.record.clone()); }
+  }
+  if (!records.is_empty() && !persist_stop(self.data_dir, task, records.as_slice())) {
+    post(self.outbox, entry_message(task, said("stop.storage", "error", "The worker could not save the stop request.")));
+    return;
+  }
+  for (let r& in self.running) {
+    if (r.task == task) {
+      r.stopped.get().store(1);
+      if (!r.record.is_empty()) { let _ = atomic_write(stop_path(r.record).as_str(), "stopped"); }
+    }
+  }
   var i: usize = 0;
   while (i < self.waiting.len()) {
     if (self.waiting[i].task == task) {
@@ -194,12 +213,6 @@ fn Crew::stop(var self&, task: str) {
       forget(order.record);
     } else {
       i += 1;
-    }
-  }
-  for (let r& in self.running) {
-    if (r.task == task) {
-      r.stopped.get().store(1);
-      if (!r.record.is_empty()) { let _ = atomic_write(stop_path(r.record).as_str(), "stopped"); }
     }
   }
 }
@@ -290,6 +303,8 @@ fn Crew::session_of(self&, task: str): String {
 // Retain completed records until their final messages have been sent.
 // A crash before this point replays them with the same entry and turn ids.
 fn Crew::sent(var self&) {
+  if (self.delivered.is_empty()) { return; }
   for (let record in self.delivered) { forget(record); }
   self.delivered.clear();
+  clear_stops(self.data_dir);
 }

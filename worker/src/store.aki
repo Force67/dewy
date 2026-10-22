@@ -4,11 +4,11 @@ module worker::store;
 
 import {String, from_str, with_nul} from akikit::strings::string;
 import {List} from akikit::containers::list;
-import {Json, to_string, parse, text, boolean} from akikit::text::json;
+import {Json, to_string, parse, text, boolean, array, push, as_array, as_str} from akikit::text::json;
 import {get_environment_variable} from akikit::process::environment_variables;
 import {create_directories, list_directory} from akikit::filesystem::directory;
 import {remove_tree} from akikit::filesystem::file_enumerator;
-import {read_file, delete_file, real_path, set_permissions} from akikit::filesystem::file_util;
+import {read_file, delete_file, real_path, set_permissions, path_exists} from akikit::filesystem::file_util;
 import {join} from akikit::filesystem::path;
 import {ends_with} from akikit::strings::string_search;
 import {sort} from akikit::algorithm;
@@ -104,4 +104,63 @@ pub fn resolve_order(record: str, session: str, yolo: bool): bool {
   put(msg, "yolo", boolean(yolo));
   if (let _ = atomic_write(record, to_string(msg))) { return true; }
   return false;
+}
+
+// One atomic marker covers the whole stop, before queued records are removed.
+// Recording paths rather than a task-wide flag lets later replies run normally.
+pub fn cancellation_path(dir: str, task: str): String => join(dir, f"{key(task)}.cancel");
+
+pub fn persist_stop(dir: str, task: str, records&: [String]): bool {
+  var stopped = array();
+  for (let record in records) { push(stopped, text(record)); }
+  if (let _ = atomic_write(cancellation_path(dir, task), to_string(stopped))) { return true; }
+  return false;
+}
+
+fn stopped_records(path: str): List<String>? {
+  let body = read_file(path) else { return none; };
+  let json = parse(body) else { return none; };
+  let values = as_array(json) else { return none; };
+  var records = List::<String>();
+  for (let value in values) {
+    let record = as_str(value) else { return none; };
+    records.push(from_str(record));
+  }
+  return records;
+}
+
+pub fn cancelled(marker: str, record: str): bool {
+  let records = stopped_records(marker) else { return path_exists(marker); };
+  for (let stopped in records) { if (stopped == record) { return true; } }
+  return false;
+}
+
+// Recover cancellation before starting any saved turn. Unlaunched orders
+// must be discarded even when the old worker died halfway through cleanup.
+pub fn recover_stops(dir: str): bool {
+  for (let name in list_directory(dir) ?? List::<String>()) {
+    if (!ends_with(name, ".cancel")) { continue; }
+    let records = stopped_records(join(dir, name)) else { return false; };
+    for (let record in records) {
+      if (!path_exists(record)) { continue; }
+      if (path_exists(join(run_dir(record), "launch.json"))) {
+        if (let _ = atomic_write(stop_path(record), "stopped")) {} else { return false; }
+      } else {
+        forget(record);
+      }
+    }
+  }
+  clear_stops(dir);
+  return true;
+}
+
+pub fn clear_stops(dir: str) {
+  for (let name in list_directory(dir) ?? List::<String>()) {
+    if (!ends_with(name, ".cancel")) { continue; }
+    let marker = join(dir, name);
+    let records = stopped_records(marker) else { continue; };
+    var pending = false;
+    for (let record in records) { if (path_exists(record)) { pending = true; } }
+    if (!pending) { let _ = delete_file(marker); }
+  }
 }

@@ -3,6 +3,7 @@
 Run after `akiko build worker`: python3 worker/tests/tmux_integration.py
 """
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -50,7 +52,8 @@ if config.get('exit'):
     print('fake agent failure detail', file=sys.stderr, flush=True)
     sys.exit(config['exit'])
 if config.get('child'):
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL if config.get('leader_exits_on_term') else signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
     child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)'])
     (root/'child.pid').write_text(str(child.pid))
 gate = config.get('gate')
@@ -246,6 +249,81 @@ class TmuxWorkerTest(unittest.TestCase):
         wait_for(lambda: not alive(child))
         self.assertEqual(len(self.calls()), 1)
         self.assertFalse(alive(self.calls()[0]['pid']))
+
+    def test_stop_interrupted_during_queue_cleanup(self):
+        self.start_worker()
+        self.turn(gate='never')
+        self.started()
+        for n in range(2, 502):
+            self.turn(turn=f't{n}', note='must not run')
+        wait_for(lambda: len(list(self.data.glob('*.json'))) == 501)
+        queued = sorted(self.data.glob('*.json'))[1]
+        # Slow the first queued record's cleanup so the crash lands after
+        # its unlink and before the remaining orders have been removed.
+        remnants = Path(str(queued)+'.run')
+        remnants.mkdir()
+        for n in range(2000):
+            (remnants/str(n)).touch()
+        self.send(dict(type='stop', task='1'))
+        wait_for(lambda: not queued.exists())
+        self.kill_worker()
+        self.start_worker()
+        self.ended(state='stopped')
+        wait_for(lambda: not alive(self.calls()[0]['pid']))
+        self.assertEqual(len(self.calls()), 1)
+        self.assertFalse(list(self.data.glob('*.json')))
+        # A new reply after the stop is not covered by the old marker.
+        self.turn(turn='t502', note='new reply')
+        self.ended()
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_abandon_kills_tools_after_leader_is_reaped(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        done = threading.Event()
+        reaped = threading.Event()
+        reaper = None
+        child = None
+        try:
+            self.start_worker()
+            self.turn(gate='never', child=True, leader_exits_on_term=True)
+            self.started()
+            child = int(wait_for(lambda: (self.root/'child.pid').read_text()
+                                if (self.root/'child.pid').exists() else None))
+            leader = self.calls()[0]['pid']
+            self.kill_worker()
+            # Model init promptly reaping the orphan leader after TERM.
+            def reap_leader():
+                while not done.is_set():
+                    try:
+                        if os.waitpid(leader, os.WNOHANG)[0]:
+                            reaped.set()
+                            return
+                    except ChildProcessError:
+                        pass
+                    time.sleep(.005)
+            reaper = threading.Thread(target=reap_leader)
+            reaper.start()
+            subprocess.run([TMUX, '-S', str(self.tmux_socket), 'kill-server'], check=True)
+            self.start_worker()
+            self.ended(state='failed')
+            self.assertTrue(reaped.wait(3), 'agent leader was not reaped')
+            wait_for(lambda: not alive(child), timeout=4)
+            self.assertEqual(len(self.calls()), 1)
+        finally:
+            done.set()
+            if reaper:
+                reaper.join(timeout=1)
+            if child:
+                if alive(child):
+                    os.kill(child, signal.SIGKILL)
+                try:
+                    os.waitpid(child, 0)
+                except ChildProcessError:
+                    pass
+            libc.prctl(36, previous.value, 0, 0, 0)
 
     def test_all_adapters_preserve_literal_arguments_and_images(self):
         self.start_worker()

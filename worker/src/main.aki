@@ -97,7 +97,10 @@ fn run(o&: Options): i32 {
   };
   print(f"worker: tmux socket {socket_path(store.dir)}\n".as_str());
   var crew = Crew(o.flag("yolo"), store.dir);
-  crew.recover();
+  if (!crew.recover()) {
+    eprintln("worker: could not recover saved stop requests; check the state directory");
+    return 2;
+  }
   let _measuring = spawn(measure_forever, MeasureJob { outbox: crew.share_outbox() });
   var pause = seconds(1);
   while (true) {

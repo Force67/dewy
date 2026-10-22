@@ -20,7 +20,8 @@ All worker-run agent turns use tmux. A missing tmux executable fails worker star
 - The network worker tails output while it runs. On restart it loads saved orders before its hello, follows already launched turns without relaunching them, and replays their output with the same entry ids. A saved launch that no longer has a live tmux session or exit status fails rather than repeating the agent's work.
 - Usage messages include the turn id and cumulative tokens and cost. The orchestrator persists per-turn maxima and charges only increases, including when an older completed turn is replayed. Messages without a turn id retain the old delta semantics. Codex rollout totals are bounded when the supervisor finishes so replay cannot charge a later turn's tokens.
 - Completed records and input files remain until their final messages have been sent. Then the worker removes them. This retains the existing TCP delivery semantics; it does not add an orchestrator acknowledgement protocol.
-- Cancelling a task persists its stop request and discards saved queued replies. Restarting the network worker during cancellation does not undo it.
+- Cancelling a task atomically saves the exact running and queued records covered by the stop before discarding queued replies. Recovery applies that snapshot before loading orders, so a crash during cleanup cannot revive cancelled work or cancel later replies.
+- When a tmux supervisor disappears, the worker validates the saved process identity and snapshots its group members before terminating the group. Escalation checks those members' identities so tools are still killed after the leader is reaped, without trusting a reused process group number.
 
 ## Consequences
 
@@ -32,4 +33,4 @@ All worker-run agent turns use tmux. A missing tmux executable fails worker star
 
 ## Validation
 
-Backend unit tests cover the existing protocol and transcript parsers, plus cumulative usage replay across orchestrator restarts. Real tmux integration tests run fake Claude, Codex, and opencode commands to exercise worker crashes, queued replies, completion while disconnected, cancellation, argv and image preservation, required tmux, and the state directory lock.
+Backend unit tests cover the existing protocol and transcript parsers, plus cumulative usage replay across orchestrator restarts. Real tmux integration tests run fake Claude, Codex, and opencode commands to exercise worker crashes, queued replies, completion while disconnected, interrupted cancellation cleanup, orphaned tool processes, argv and image preservation, required tmux, and the state directory lock.

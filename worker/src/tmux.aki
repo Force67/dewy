@@ -12,17 +12,18 @@ import {set_environment_variable} from akikit::process::environment_variables;
 import {starts_with, split_once, trim} from akikit::strings::string_search;
 import {parse_i32} from akikit::strings::string_to_number;
 import {sha256, digest_to_hex} from akikit::hashing::sha256;
-import {Command, spawn_error_message, exit_code, send_signal, kSignalTerminate, kSignalKill} from akikit::process::child;
-import {milliseconds, seconds, sleep, now} from akikit::time::time;
+import {Command, spawn_error_message, exit_code, kSignalTerminate, kSignalKill} from akikit::process::child;
+import {milliseconds, seconds, sleep} from akikit::time::time;
 import {str_of, num_of} from wire::fields;
 import {Invocation, command_of} from worker::invocation;
 import {output_of} from worker::command;
-import {key} from worker::store;
+import {key, stop_path, cancelled} from worker::store;
 import {atomic_write} from wire::files;
-import {alive, process_start} from worker::terminal;
+import {process_start} from worker::terminal;
 import {private_temp} from worker::turn;
 import {rollout_of, last_total} from worker::codex;
 import {open_tail} from worker::tail;
+import {terminate_group} from worker::process_group;
 
 extern("clearenv") fn c_clearenv(): i32;
 
@@ -58,7 +59,7 @@ pub fn exists(socket: str, session: str): bool {
 // Save the exact invocation before launching, including the starting
 // session and Codex token baseline. Recovery never starts a launched turn twice.
 pub fn launch(socket: str, session: str, dir: str, project: str, input: str,
-              stop: str, invocation&: Invocation): bool {
+              record: str, cancellation: str, invocation&: Invocation): bool {
   var c = tmux(socket, "new-session", "-d", "-s", session, "-c", project);
   // A long-lived tmux server otherwise retains the environment of the
   // first worker. Copy this worker's environment for each new turn.
@@ -76,7 +77,9 @@ pub fn launch(socket: str, session: str, dir: str, project: str, input: str,
   for (let a in invocation.args) { push(args, text(a)); }
   set(j, "args", args);
   set(j, "environment", environment);
-  set(j, "project", text(project)); set(j, "input", text(input)); set(j, "stop", text(stop));
+  set(j, "project", text(project)); set(j, "input", text(input)); set(j, "stop", text(stop_path(record)));
+  set(j, "record", text(record));
+  set(j, "cancellation", text(cancellation));
   if (let _ = atomic_write(join(dir, "launch.json"), to_string(j))) {} else { return false; }
   return output_of(c) != none;
 }
@@ -129,7 +132,9 @@ pub fn supervise(dir: str): i32 {
     }
   }
   let stop = str_of(j, "stop") ?? "";
-  if (path_exists(stop)) { return finish(dir, 143); }
+  let record = str_of(j, "record") ?? "";
+  let cancellation = str_of(j, "cancellation") ?? "";
+  if (path_exists(stop) || cancelled(cancellation, record)) { return finish(dir, 143); }
   var invocation = Invocation(as_str(args[0]) ?? "");
   for (let i in 1usize..#args) { invocation.arg(as_str(args[i]) ?? ""); }
   var c = command_of(invocation);
@@ -147,7 +152,7 @@ pub fn supervise(dir: str): i32 {
   set(identity, "start", text((process_start(child.id()) ?? String()).as_str()));
   let _ = atomic_write(join(dir, "process.json").as_str(), to_string(identity).as_str());
   while (true) {
-    if (path_exists(stop)) {
+    if (path_exists(stop) || cancelled(cancellation, record)) {
       let _ = child.signal_group(kSignalTerminate);
       // Do not reap the leader before the final signal: its pid cannot
       // be reused while it is a zombie, so the group is still ours.
@@ -169,10 +174,5 @@ pub fn abandon(dir: str) {
   let j = parse(body) else { return; };
   let pid = (num_of(j, "pid") ?? 0.0) as i32;
   let start = str_of(j, "start") ?? "";
-  if (alive(pid, start)) {
-    let _ = send_signal(-pid, kSignalTerminate);
-    let began = now();
-    while (alive(pid, start) && began.elapsed() < seconds(2)) { sleep(milliseconds(100)); }
-    if (alive(pid, start)) { let _ = send_signal(-pid, kSignalKill); }
-  }
+  terminate_group(pid, start);
 }
