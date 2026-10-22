@@ -54,6 +54,8 @@ Workers always run agent turns in detached tmux sessions. Running turns and queu
 
 The app asks for the orchestrator's address (port 8787) and the token. Workers connect out, so machines behind NAT need no open port. `akiko test` and `./gradlew testDebugUnitTest` run the tests.
 
+For startup at boot, see the [systemd service setup](deploy/systemd/README.md).
+
 ## Before you rely on it
 
 - The orchestrator speaks plain HTTP with one shared token. Keep it on a tailnet or behind a TLS proxy.
