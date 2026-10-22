@@ -1,9 +1,9 @@
 module clip_test;
 
-import {eprintln} from akibase::logging;
+import {eprintln} from akikit::logging;
 import {clip, first_line} from wire::clip;
 
-fn check(ok: bool, what: str, var failures&: i32): () {
+fn check(ok: bool, what: str, var failures&: i32) {
   if (!ok) {
     eprintln(what);
     failures += 1;

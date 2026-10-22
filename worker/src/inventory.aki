@@ -4,32 +4,30 @@
 
 module worker::inventory;
 
-import {String, from_str} from akibase::strings::base_string;
-import {new} from akibase::containers::vector;
-import {Json, object, array, set, push, text, number, boolean} from akibase::text::json;
-import {get_environment_variable} from akibase::environment_variables;
-import {read_file, path_exists} from akibase::filesystem::file_util;
-import {is_directory, list_directory} from akibase::filesystem::directory;
-import {join, file_name} from akibase::filesystem::path;
-import {split, split_whitespace, lines} from akibase::strings::string_util;
-import {trim, strip_prefix, trim_matches} from akibase::strings::string_search;
-import {parse_f64} from akibase::strings::string_to_number;
-import {sort} from akibase::algorithm;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, object, array, set, push, text, number, boolean} from akikit::text::json;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {read_file, path_exists} from akikit::filesystem::file_util;
+import {is_directory, list_directory} from akikit::filesystem::directory;
+import {join, file_name} from akikit::filesystem::path;
+import {split, split_whitespace, lines} from akikit::strings::string_util;
+import {trim, strip_prefix, trim_matches} from akikit::strings::string_search;
+import {parse_f64} from akikit::strings::string_to_number;
+import {sort} from akikit::algorithm;
 import {opencode_models} from worker::opencode;
-import {private_temp} from worker::turn;
-import {system_now} from akibase::time::time;
-import {Command} from akibase::process::child;
+import {Command} from akikit::process::child;
 import {output_of} from worker::command;
-import {contains} from akibase::strings::string_search;
+import {contains} from akikit::strings::string_search;
 
 pub fn hostname(): String {
   let name = read_file("/proc/sys/kernel/hostname") ?? from_str("box");
-  return from_str(trim(name.as_str()));
+  return from_str(trim(name));
 }
 
 fn os_name(): String {
   let release = read_file("/etc/os-release") ?? String();
-  for (let line in lines(release.as_str())) {
+  for (let line in lines(release)) {
     if (let v = strip_prefix(line, "PRETTY_NAME=")) {
       return from_str(trim_matches(v, "\""));
     }
@@ -39,7 +37,7 @@ fn os_name(): String {
 
 pub fn on_path(program: str): bool {
   let path = get_environment_variable("PATH") ?? String();
-  for (let dir in split(path.as_str(), ":")) {
+  for (let dir in split(path, ":")) {
     if (#dir > 0 && path_exists(join(dir, program).as_str())) {
       return true;
     }
@@ -48,15 +46,15 @@ pub fn on_path(program: str): bool {
 }
 
 fn repositories(roots&: [String]): Json {
-  var paths = new::<String>();
+  var paths = List::<String>();
   for (let root& in roots) {
-    if (is_directory(join(root.as_str(), ".git").as_str())) {
+    if (is_directory(join(root, ".git").as_str())) {
       paths.push(root.clone());
       continue;
     }
-    for (let name& in list_directory(root.as_str()) ?? new::<String>()) {
-      let dir = join(root.as_str(), name.as_str());
-      if (is_directory(join(dir.as_str(), ".git").as_str())) {
+    for (let name& in list_directory(root) ?? List::<String>()) {
+      let dir = join(root, name);
+      if (is_directory(join(dir, ".git").as_str())) {
         paths.push(dir);
       }
     }
@@ -65,8 +63,8 @@ fn repositories(roots&: [String]): Json {
   var out = array();
   for (let p& in paths) {
     var o = object();
-    set(o, "name", text(file_name(p.as_str())));
-    set(o, "path", text(p.as_str()));
+    set(o, "name", text(file_name(p)));
+    set(o, "path", text(p));
     push(out, o);
   }
   return out;
@@ -77,9 +75,7 @@ fn repositories(roots&: [String]): Json {
 pub fn models(): Json {
   var out = object();
   if (on_path("opencode")) {
-    var stem = from_str("dewy-models-");
-    stem.push_i64(system_now().unix_nanoseconds());
-    set(out, "opencode", opencode_models(join(private_temp().as_str(), stem.as_str()).as_str()));
+    set(out, "opencode", opencode_models());
   }
   return out;
 }
@@ -112,10 +108,10 @@ fn can_power_off(): bool {
   for (let a in ["call", "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "CanPowerOff"]) {
     c.arg(a);
   }
-  let answer = output_of(c, "power") else {
+  let answer = output_of(c) else {
     return false;
   };
-  return contains(answer.as_str(), "\"yes\"");
+  return contains(answer, "\"yes\"");
 }
 
 fn meminfo_kb(info: str, key: str): f64 {
@@ -133,23 +129,23 @@ fn meminfo_kb(info: str, key: str): f64 {
 pub fn stats(): Json {
   var s = object();
   let load = read_file("/proc/loadavg") ?? String();
-  let words = split_whitespace(load.as_str());
+  let words = split_whitespace(load);
   set(s, "load", number(words.len() > 0 ? parse_f64(words[0]) ?? 0.0 : 0.0));
   let cpu = read_file("/proc/cpuinfo") ?? String();
   var cpus: u32 = 0;
-  for (let line in lines(cpu.as_str())) {
+  for (let line in lines(cpu)) {
     if (strip_prefix(line, "processor") != none) {
       cpus += 1;
     }
   }
   set(s, "cpus", number(cpus as f64));
   let mem = read_file("/proc/meminfo") ?? String();
-  let total = meminfo_kb(mem.as_str(), "MemTotal:");
-  let available = meminfo_kb(mem.as_str(), "MemAvailable:");
+  let total = meminfo_kb(mem, "MemTotal:");
+  let available = meminfo_kb(mem, "MemAvailable:");
   set(s, "memTotal", number(total * 1024.0));
   set(s, "memUsed", number((total - available) * 1024.0));
   let up = read_file("/proc/uptime") ?? String();
-  let up_words = split_whitespace(up.as_str());
+  let up_words = split_whitespace(up);
   set(s, "uptime", number(up_words.len() > 0 ? parse_f64(up_words[0]) ?? 0.0 : 0.0));
   var m = object();
   set(m, "type", text("stats"));

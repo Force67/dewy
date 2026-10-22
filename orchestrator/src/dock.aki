@@ -4,15 +4,15 @@
 
 module orchestrator::dock;
 
-import {String} from akibase::strings::base_string;
-import {Vector} from akibase::containers::vector;
-import {TcpStream} from akibase::net::tcp;
-import {SharedPointer} from akibase::memory::shared_pointer;
-import {Json, object, array, set, push, get, as_array, text} from akibase::text::json;
-import {milliseconds, seconds, now} from akibase::time::time;
-import {eprintln} from akibase::logging;
+import {String} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {TcpStream} from akikit::net::tcp;
+import {Arc} from akikit::memory::arc;
+import {Json, object, array, set, push, get, as_array, text} from akikit::text::json;
+import {milliseconds, seconds, now} from akikit::time::time;
+import {eprintln} from akikit::logging;
 import {LineStream} from wire::line_stream;
-import {str_of, copy, put} from wire::fields;
+import {str_of, put} from wire::fields;
 import {decode} from wire::base64;
 import {store} from orchestrator::images;
 import {Board} from orchestrator::board;
@@ -20,16 +20,16 @@ import {Hub, now_ms} from orchestrator::hub;
 
 pub struct DockConnection : Send {
   pub var stream: TcpStream
-  pub var hub: SharedPointer<Hub>
+  pub var hub: Arc<Hub>
 }
 
-pub fn serve_worker(c: DockConnection): () {
+pub fn serve_worker(c: DockConnection) {
   var stream = c.stream;
   let hub& = c.hub.get();
   let _ = stream.set_read_timeout(milliseconds(250));
   let _ = stream.set_write_timeout(seconds(10));
   var link = LineStream(stream);
-  let hello = read_hello(link, hub.token.as_str()) else {
+  let hello = read_hello(link, hub.token) else {
     return;
   };
   let name = hub.board.with(fn(b: &var Board): String => b.attach(hello, now_ms()));
@@ -39,17 +39,17 @@ pub fn serve_worker(c: DockConnection): () {
     if (let got = link.read()) {
       if (let msg = got) {
         var m = msg;
-        keep_images(hub.data.as_str(), m);
-        hub.board.with(fn(b: &var Board): () => b.apply(name.as_str(), m, now_ms()));
+        keep_images(hub.data, m);
+        hub.board.with(fn(b: &var Board): () => b.apply(name, m, now_ms()));
         hub.changed.notify_all();
       }
     } else {
       break;
     }
-    let out = hub.board.with(fn(b: &var Board): Vector<String> => b.take_outbox(name.as_str()));
+    let out = hub.board.with(fn(b: &var Board): List<String> => b.take_outbox(name));
     var sent = true;
     for (let line& in out) {
-      if (let _ = link.send_text(line.as_str())) {
+      if (let _ = link.send_text(line)) {
       } else {
         sent = false;
       }
@@ -58,7 +58,7 @@ pub fn serve_worker(c: DockConnection): () {
       break;
     }
   }
-  hub.board.with(fn(b: &var Board): () => b.detach(name.as_str(), now_ms()));
+  hub.board.with(fn(b: &var Board): () => b.detach(name, now_ms()));
   hub.changed.notify_all();
   eprintln(f"dock: {name} left".as_str());
 }
@@ -80,11 +80,12 @@ fn read_hello(var link&: LineStream, token: str): Json? {
 
 // An entry carries the images an agent looked at as base64; they are stored
 // here, and the entry keeps their ids, so the board needs no I/O.
-fn keep_images(data_dir: str, var msg&: Json): () {
+fn keep_images(data_dir: str, var msg&: Json) {
   if ((str_of(msg, "type") ?? "") != "entry") {
     return;
   }
-  var e = copy(get(msg, "entry") ?? Json::Null);
+  let entry& = get(msg, "entry") else { return; };
+  var e = entry.clone();
   let list = as_array(get(e, "images") ?? Json::Null) else {
     return;
   };
@@ -96,7 +97,7 @@ fn keep_images(data_dir: str, var msg&: Json): () {
     };
     if (let id = store(data_dir, data.as_slice(), media)) {
       var o = object();
-      set(o, "id", text(id.as_str()));
+      set(o, "id", text(id));
       set(o, "type", text(media));
       push(kept, o);
     }

@@ -18,20 +18,20 @@
 
 module orchestrator::api;
 
-import {String} from akibase::strings::base_string;
-import {TcpStream} from akibase::net::tcp;
+import {String} from akikit::strings::string;
+import {TcpStream} from akikit::net::tcp;
 import {Request, finish, header, kMaxHead, path_part, read_error_status, read_request, send_response, error_body}
-  from akibase::net::http;
+  from akikit::net::http;
 import {gzip} from orchestrator::gzip;
 import {kMaxImage, kMaxImages, store, load} from orchestrator::images;
 import {encode} from wire::base64;
-import {SharedPointer} from akibase::memory::shared_pointer;
-import {Json, object, array, set, push, get, as_array, as_str, text, number, boolean, parse, to_string} from akibase::text::json;
-import {utf8_lossy} from akibase::text::code_convert;
-import {split} from akibase::strings::string_util;
-import {contains, find, strip_prefix, trim} from akibase::strings::string_search;
-import {parse_u64} from akibase::strings::string_to_number;
-import {seconds} from akibase::time::time;
+import {Arc} from akikit::memory::arc;
+import {Json, object, array, set, push, get, as_array, as_str, text, number, boolean, parse, to_string} from akikit::text::json;
+import {utf8_lossy} from akikit::text::code_convert;
+import {split} from akikit::strings::string_util;
+import {contains, find, strip_prefix, trim} from akikit::strings::string_search;
+import {parse_u64} from akikit::strings::string_to_number;
+import {seconds} from akikit::time::time;
 import {str_of, bool_of} from wire::fields;
 import {Board, Refusal, refusal_message} from orchestrator::board;
 import {Hub, now_ms} from orchestrator::hub;
@@ -44,7 +44,7 @@ comptime let kGzipFrom: usize = 1024;
 
 pub struct AppConnection : Send {
   pub var stream: TcpStream
-  pub var hub: SharedPointer<Hub>
+  pub var hub: Arc<Hub>
 }
 
 struct Reply {
@@ -80,7 +80,7 @@ fn ok_reply(): Reply {
   return json_reply(200, o);
 }
 
-pub fn serve_app(c: AppConnection): () {
+pub fn serve_app(c: AppConnection) {
   var stream = c.stream;
   let hub& = c.hub.get();
   let _ = stream.set_read_timeout(seconds(10));
@@ -93,17 +93,17 @@ pub fn serve_app(c: AppConnection): () {
     }
     return;
   };
-  let path = path_part(r.target.as_str());
-  if (path != "/api/health" && !authorized(r, hub.token.as_str())) {
+  let path = path_part(r.target);
+  if (path != "/api/health" && !authorized(r, hub.token)) {
     send(stream, error_reply(401, "missing or wrong token"), false);
     return;
   }
   if (r.method.eq_str("GET") && path == "/api/stream") {
     // A client from before this start, which names no epoch or an old one,
     // resumes from a seq that means something else now.
-    let epoch = query_u64(r.target.as_str(), "epoch=");
+    let epoch = query_u64(r.target, "epoch=");
     let current = epoch == 0 || epoch == hub.epoch as u64;
-    stream_changes(stream, hub, query_u64(r.target.as_str(), "since="), current);
+    stream_changes(stream, hub, query_u64(r.target, "since="), current);
     return;
   }
   if (r.method.eq_str("GET")) {
@@ -117,13 +117,13 @@ pub fn serve_app(c: AppConnection): () {
 }
 
 // Images never change, so the app keeps them for good.
-fn serve_image(var stream&: TcpStream, hub&: Hub, id: str): () {
-  let img = load(hub.data.as_str(), id) else {
+fn serve_image(var stream&: TcpStream, hub&: Hub, id: str) {
+  let img = load(hub.data, id) else {
     send(stream, error_reply(404, "no such image"), false);
     return;
   };
   let extra = [header("Cache-Control", "private, max-age=31536000, immutable")];
-  let _ = send_response(stream, 200, img.media.as_str(), img.data.as_slice(), extra, true);
+  let _ = send_response(stream, 200, img.media, img.data.as_slice(), extra, true);
   finish(stream);
 }
 
@@ -132,11 +132,11 @@ fn upload_image(r&: Request, hub&: Hub): Reply {
   if (let at = find(media, ";")) {
     media = media[..at];
   }
-  let id = store(hub.data.as_str(), r.body.as_slice(), trim(media)) else {
+  let id = store(hub.data, r.body.as_slice(), trim(media)) else {
     return error_reply(400, "not a JPEG, PNG, WebP, or GIF image of at most 4 MiB");
   };
   var o = object();
-  set(o, "id", text(id.as_str()));
+  set(o, "id", text(id));
   return json_reply(201, o);
 }
 
@@ -151,7 +151,7 @@ fn message_images(body&: Json, hub&: Hub): Json ! Reply {
   }
   var total: usize = 0;
   for (let v& in ids) {
-    let img = load(hub.data.as_str(), as_str(v) ?? "") else {
+    let img = load(hub.data, as_str(v) ?? "") else {
       return fail error_reply(400, "no such image");
     };
     total += img.data.len();
@@ -160,14 +160,14 @@ fn message_images(body&: Json, hub&: Hub): Json ! Reply {
     }
     var o = object();
     set(o, "id", text(as_str(v) ?? ""));
-    set(o, "type", text(img.media.as_str()));
+    set(o, "type", text(img.media));
     set(o, "data", text(encode(img.data.as_slice()).as_str()));
     push(out, o);
   }
   return out;
 }
 
-fn send(var stream&: TcpStream, reply: Reply, gz: bool): () {
+fn send(var stream&: TcpStream, reply: Reply, gz: bool) {
   // Threads are long and repetitive, so gzip shrinks them several times over.
   if (gz && reply.body.len() >= kGzipFrom) {
     if (let packed = gzip(reply.body.as_bytes())) {
@@ -325,7 +325,7 @@ fn attach_session(r&: Request, hub&: Hub): Reply {
 fn created_reply(created: String ! Refusal, hub&: Hub): Reply {
   hub.changed.notify_all();
   if (let id = created) {
-    let found = hub.board.with(fn(b: &var Board): Json? => b.task_json(id.as_str()));
+    let found = hub.board.with(fn(b: &var Board): Json? => b.task_json(id));
     if (let j = found) {
       return json_reply(201, j);
     }

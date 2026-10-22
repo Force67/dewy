@@ -5,38 +5,32 @@
 
 module orchestrator::stream;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector} from akibase::containers::vector;
-import {TcpStream} from akibase::net::tcp;
-import {now, seconds} from akibase::time::time;
+import {String, str_as_bytes} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {TcpStream} from akikit::net::tcp;
+import {now, seconds} from akikit::time::time;
 import {Board} from orchestrator::board;
 import {Hub} from orchestrator::hub;
 
 comptime let kHead: str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n";
 
 struct Batch {
-  pub var frames: Vector<String>?
+  pub var frames: List<String>?
   pub var seq: u64
 }
 
-pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64, current: bool): () {
-  if (let _ = stream.write_all(from_str(kHead).as_bytes())) {
-  } else {
-    return;
-  }
-  var seq = since;
-  if (!current) {
-    // No frame can match; the first batch resets.
-    seq = 0xffff_ffff_ffff_ffff;
-  }
+pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64, current: bool) {
+  let _ = stream.write_all(str_as_bytes(kHead)) else { return; };
+  // A position from an earlier start forces the first batch to reset.
+  var seq = current ? since : @max_of(u64);
   var last_write = now();
   while (true) {
     let seen = hub.changed.current();
-    let batch = hub.board.with(fn(b: &var Board): Batch => Batch { frames: b.frames_since(seq), seq: b.last_seq() });
+    let batch = hub.board.read(fn(b&: Board): Batch => Batch { frames: b.frames_since(seq), seq: b.last_seq() });
     var out = String();
     if (let frames = batch.frames) {
       for (let f& in frames) {
-        out.push_str(f.as_str());
+        out.push_str(f);
       }
       seq = batch.seq;
     } else {
@@ -45,7 +39,7 @@ pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64, current: bo
     }
     // A comment line now and then keeps proxies and NAT from closing an
     // idle stream, and finds clients that left.
-    if (out.len() == 0 && last_write.elapsed() > seconds(20)) {
+    if (out.len() == 0 && last_write.elapsed() >= seconds(20)) {
       out.push_str(": ping\n\n");
     }
     if (out.len() > 0) {
@@ -55,6 +49,9 @@ pub fn stream_changes(var stream&: TcpStream, hub&: Hub, since: u64, current: bo
         return;
       }
     }
-    hub.changed.wait_change(seen);
+    let until_ping = seconds(20).as_nanoseconds() - last_write.elapsed().as_nanoseconds();
+    if (until_ping > 0) {
+      let _ = hub.changed.wait_change_for(seen, until_ping as u64);
+    }
   }
 }

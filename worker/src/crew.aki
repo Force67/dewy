@@ -4,26 +4,30 @@
 
 module worker::crew;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Json, object, set, array, push, text, get, as_array} from akibase::text::json;
-import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
-import {Mutex} from akibase::threading::mutex;
-import {Atomic} from akibase::atomic;
-import {Thread, spawn} from akibase::threading::thread;
-import {Command, send_signal, kSignalTerminate} from akibase::process::child;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, object, set, array, push, text, get, as_array} from akikit::text::json;
+import {Arc, make_arc} from akikit::memory::arc;
+import {Mutex} from akikit::threading::mutex;
+import {Atomic} from akikit::threading::atomic;
+import {Thread, spawn} from akikit::threading::thread;
+import {Command} from akikit::process::child;
 import {output_of} from worker::command;
-import {replace} from akibase::algorithm;
+import {replace} from akikit::algorithm;
 import {str_of, string_of, bool_of} from wire::fields;
 import {said, entry_message} from worker::entry;
-import {Ended, Outbox, TurnImage, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
+import {Ended, Outbox, SharedOutbox, TurnImage, TurnJob, TurnOrder, agent_named, post, run_turn, state_message} from worker::turn;
 import {find_session} from worker::terminal;
 import {WatchJob, watch_session} from worker::watch;
+import {read_file} from akikit::filesystem::file_util;
+import {parse} from akikit::text::json;
+import {save_order, resolve_order, orders, stop_path, forget, persist_stop, recover_stops, clear_stops} from worker::store;
+import {atomic_write} from wire::files;
 
 struct Running {
   pub var task: String
-  pub var pid: SharedPointer<Atomic<i32>>
-  pub var stopped: SharedPointer<Atomic<i32>>
+  pub var record: String
+  pub var stopped: Arc<Atomic<i32>>
   pub var thread: Thread<()>
   // Following a session in a terminal rather than running a turn.
   pub var watch: bool
@@ -35,33 +39,38 @@ struct Session {
 }
 
 pub struct Crew {
-  var outbox: SharedPointer<Mutex<Outbox>>
-  var running: Vector<Running>
-  var waiting: Vector<TurnOrder>
-  var sessions: Vector<Session>
+  var outbox: SharedOutbox
+  var running: List<Running> = List()
+  var waiting: List<TurnOrder> = List()
+  var sessions: List<Session> = List()
   var yolo: bool
+  var data_dir: String
+  var delivered: List<String> = List()
 
-  pub fn Crew(yolo: bool): Crew;
-  pub fn order(var self&, msg&: Json): ();
-  pub fn collect(var self&): Vector<String>;
-  pub fn put_back(var self&, lines: Vector<String>): ();
+  pub fn Crew(yolo: bool, data_dir: str): Crew;
+  pub fn recover(var self&): bool;
+  pub fn sent(var self&);
+  fn accept(var self&, msg&: Json, record: str);
+  pub fn order(var self&, msg&: Json);
+  pub fn collect(var self&): List<String>;
+  pub fn put_back(var self&, lines: List<String>);
   pub fn running_tasks(self&): Json;
-  pub fn share_outbox(self&): SharedPointer<Mutex<Outbox>>;
-  fn start(var self&, o: TurnOrder): ();
-  fn watch(var self&, task: str, session: str): ();
-  fn stop(var self&, task: str): ();
+  pub fn share_outbox(self&): SharedOutbox;
+  fn start(var self&, o: TurnOrder);
+  fn watch(var self&, task: str, session: str);
+  fn stop(var self&, task: str);
   fn is_running(self&, task: str): bool;
   fn session_of(self&, task: str): String;
-  fn remember(var self&, e: Ended): ();
+  fn remember(var self&, e: Ended);
 }
 
-fn Crew::Crew(yolo: bool): Crew => Crew {
-  outbox: make_shared(Mutex::<Outbox>(Outbox { lines: new::<String>(), ended: new::<Ended>(), measured: String() })),
-  running: new::<Running>(), waiting: new::<TurnOrder>(), sessions: new::<Session>(), yolo
+fn Crew::Crew(yolo: bool, data_dir: str): Crew => Crew {
+  outbox: make_arc(Mutex::<Outbox>(Outbox {})),
+  yolo, data_dir: from_str(data_dir)
 };
 
 // A line from the orchestrator: a turn to run or a task to stop.
-fn Crew::order(var self&, msg&: Json): () {
+fn Crew::order(var self&, msg&: Json) {
   let kind = str_of(msg, "type") ?? "";
   let task = str_of(msg, "task") ?? "";
   if (kind == "stop") {
@@ -78,7 +87,7 @@ fn Crew::order(var self&, msg&: Json): () {
     var c = Command("systemctl");
     c.arg("--no-ask-password");
     c.arg("poweroff");
-    if (output_of(c, "poweroff") == none) {
+    if (output_of(c) == none) {
       var m = object();
       set(m, "type", text("poweroff"));
       set(m, "error", text("systemctl poweroff failed on the box."));
@@ -89,14 +98,36 @@ fn Crew::order(var self&, msg&: Json): () {
   if (kind != "turn") {
     return;
   }
-  let agent = agent_named(str_of(msg, "agent") ?? "") else {
+  if (agent_named(str_of(msg, "agent") ?? "") == none) {
     var e = entry_message(task, said("agent", "error", "This box has no such agent."));
     post(self.outbox, e);
     post(self.outbox, state_message(task, "failed"));
     return;
   };
+  if (let record = save_order(self.data_dir, msg)) {
+    self.accept(msg, record);
+  } else {
+    post(self.outbox, entry_message(task, said("storage", "error", "The worker could not save this turn.")));
+    post(self.outbox, state_message(task, "failed"));
+  }
+}
+
+// Recovered orders enter the same per-task queue as new messages.
+fn Crew::recover(var self&): bool {
+  if (!recover_stops(self.data_dir)) { return false; }
+  for (let path in orders(self.data_dir)) {
+    if (let body = read_file(path)) {
+      if (let msg = parse(body)) { self.accept(msg, path); }
+    }
+  }
+  return true;
+}
+
+fn Crew::accept(var self&, msg&: Json, record: str) {
+  let task = str_of(msg, "task") ?? "";
+  let agent = agent_named(str_of(msg, "agent") ?? "") else { return; };
   let o = TurnOrder {
-    task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
+    record: from_str(record), task: from_str(task), turn: string_of(msg, "turn"), agent, project: string_of(msg, "project"),
     session: string_of(msg, "session"), text: string_of(msg, "text"), yolo: bool_of(msg, "yolo") ?? false,
     images: turn_images(msg), model: string_of(msg, "model")
   };
@@ -104,7 +135,7 @@ fn Crew::order(var self&, msg&: Json): () {
     self.waiting.push(o);
     // The session is still in its terminal: take it over.
     for (let r& in self.running) {
-      if (r.watch && r.task.as_str() == task) {
+      if (r.watch && r.task == task) {
         r.stopped.get().store(1);
       }
     }
@@ -113,8 +144,8 @@ fn Crew::order(var self&, msg&: Json): () {
   }
 }
 
-fn turn_images(msg&: Json): Vector<TurnImage> {
-  var out = new::<TurnImage>();
+fn turn_images(msg&: Json): List<TurnImage> {
+  var out = List::<TurnImage>();
   if (let list = as_array(get(msg, "images") ?? Json::Null)) {
     for (let img& in list) {
       out.push(TurnImage { id: string_of(img, "id"), media: string_of(img, "type"), data: string_of(img, "data") });
@@ -123,21 +154,26 @@ fn turn_images(msg&: Json): Vector<TurnImage> {
   return out;
 }
 
-fn Crew::start(var self&, o: TurnOrder): () {
+fn Crew::start(var self&, o: TurnOrder) {
   var order = o;
   if (order.session.is_empty()) {
-    order.session = self.session_of(order.task.as_str());
+    order.session = self.session_of(order.task);
   }
   let task = order.task.clone();
-  let pid = make_shared(Atomic::<i32>(0));
-  let stopped = make_shared(Atomic::<i32>(0));
+  let stopped = make_arc(Atomic::<i32>(0));
   let yolo = self.yolo || order.yolo;
-  let job = TurnJob { order, yolo, outbox: self.outbox.share(), pid: pid.share(), stopped: stopped.share() };
+  if (!resolve_order(order.record, order.session, yolo)) {
+    post(self.outbox, entry_message(task, said("storage", "error", "The worker could not save the turn's session.")));
+    post(self.outbox, state_message(task, "failed"));
+    return;
+  }
+  let record = order.record.clone();
+  let job = TurnJob { order, yolo, outbox: self.outbox.share(), data_dir: self.data_dir.clone(), stopped: stopped.share() };
   let thread = spawn(run_turn, job);
-  self.running.push(Running { task, pid, stopped, thread, watch: false });
+  self.running.push(Running { task, record, stopped, thread, watch: false });
 }
 
-fn Crew::watch(var self&, task: str, session: str): () {
+fn Crew::watch(var self&, task: str, session: str) {
   if (self.is_running(task)) {
     return;
   }
@@ -146,50 +182,57 @@ fn Crew::watch(var self&, task: str, session: str): () {
     post(self.outbox, state_message(task, "idle"));
     return;
   };
-  let stopped = make_shared(Atomic::<i32>(0));
+  let stopped = make_arc(Atomic::<i32>(0));
   let job = WatchJob { task: from_str(task), session: s, outbox: self.outbox.share(), stopped: stopped.share() };
   let thread = spawn(watch_session, job);
-  self.running.push(Running { task: from_str(task), pid: make_shared(Atomic::<i32>(0)), stopped, thread, watch: true });
+  self.running.push(Running { task: from_str(task), record: String(), stopped, thread, watch: true });
 }
 
-fn Crew::stop(var self&, task: str): () {
-  var i: usize = 0;
-  while (i < self.waiting.len()) {
-    if (self.waiting[i].task.as_str() == task) {
-      let _ = self.waiting.remove(i);
-    } else {
-      i += 1;
-    }
+fn Crew::stop(var self&, task: str) {
+  var records = List::<String>();
+  for (let running in self.running) {
+    if (running.task == task && !running.record.is_empty()) { records.push(running.record.clone()); }
+  }
+  for (let order in self.waiting) {
+    if (order.task == task) { records.push(order.record.clone()); }
+  }
+  if (!records.is_empty() && !persist_stop(self.data_dir, task, records.as_slice())) {
+    post(self.outbox, entry_message(task, said("stop.storage", "error", "The worker could not save the stop request.")));
+    return;
   }
   for (let r& in self.running) {
-    if (r.task.as_str() == task) {
+    if (r.task == task) {
       r.stopped.get().store(1);
-      let pid = r.pid.get().load();
-      if (pid > 0) {
-        // The agent leads its own process group; end its tools with it.
-        let _ = send_signal(-pid, kSignalTerminate);
-      }
+      if (!r.record.is_empty()) { let _ = atomic_write(stop_path(r.record).as_str(), "stopped"); }
+    }
+  }
+  var i: usize = 0;
+  while (i < self.waiting.len()) {
+    if (self.waiting[i].task == task) {
+      let order = self.waiting.remove(i);
+      forget(order.record);
+    } else {
+      i += 1;
     }
   }
 }
 
 // Ends finished turns, starts what waited on them, and hands over the
 // lines to send.
-fn Crew::collect(var self&): Vector<String> {
-  let (lines, ended) = self.outbox.get().with(fn(o: &var Outbox): (Vector<String>, Vector<Ended>) {
+fn Crew::collect(var self&): List<String> {
+  let (lines, ended) = self.outbox.get().with(fn(o: &var Outbox): (List<String>, List<Ended>) {
     if (!o.measured.is_empty()) {
       o.lines.push(replace(o.measured, String()));
     }
-    return (replace(o.lines, new::<String>()), replace(o.ended, new::<Ended>()));
+    return (replace(o.lines, List::<String>()), replace(o.ended, List::<Ended>()));
   });
-  var list = ended;
-  while (list.len() > 0) {
-    self.remember(list.remove(0));
-  }
+  var finished = ended;
+  finished.drain(fn(e: Ended) { self.remember(e); });
   return lines;
 }
 
-fn Crew::remember(var self&, e: Ended): () {
+fn Crew::remember(var self&, e: Ended) {
+  if (!e.record.is_empty()) { self.delivered.push(e.record.clone()); }
   var i: usize = 0;
   while (i < self.running.len()) {
     if (self.running[i].task.eq(e.task)) {
@@ -221,29 +264,27 @@ fn Crew::remember(var self&, e: Ended): () {
 }
 
 // Lines that could not be sent go first next time.
-fn Crew::put_back(var self&, lines: Vector<String>): () {
-  self.outbox.get().with_arg(lines, fn(o: &var Outbox, older: Vector<String>): () {
+fn Crew::put_back(var self&, lines: List<String>) {
+  self.outbox.get().with_arg(lines, fn(o: &var Outbox, older: List<String>) {
     var all = older;
-    for (let l& in o.lines) {
-      all.push(l.clone());
-    }
+    o.lines.drain(fn(line: String) { all.push(line); });
     o.lines = all;
   });
 }
 
-fn Crew::share_outbox(self&): SharedPointer<Mutex<Outbox>> => self.outbox.share();
+fn Crew::share_outbox(self&): SharedOutbox => self.outbox.share();
 
 fn Crew::running_tasks(self&): Json {
   var out = array();
   for (let r& in self.running) {
-    push(out, text(r.task.as_str()));
+    push(out, text(r.task));
   }
   return out;
 }
 
 fn Crew::is_running(self&, task: str): bool {
   for (let r& in self.running) {
-    if (r.task.as_str() == task) {
+    if (r.task == task) {
       return true;
     }
   }
@@ -252,9 +293,18 @@ fn Crew::is_running(self&, task: str): bool {
 
 fn Crew::session_of(self&, task: str): String {
   for (let s& in self.sessions) {
-    if (s.task.as_str() == task) {
+    if (s.task == task) {
       return s.id.clone();
     }
   }
   return String();
+}
+
+// Retain completed records until their final messages have been sent.
+// A crash before this point replays them with the same entry and turn ids.
+fn Crew::sent(var self&) {
+  if (self.delivered.is_empty()) { return; }
+  for (let record in self.delivered) { forget(record); }
+  self.delivered.clear();
+  clear_stops(self.data_dir);
 }

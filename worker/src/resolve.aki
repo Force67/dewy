@@ -1,10 +1,10 @@
-// Host names to IPv4 addresses through the C library, since akibase's
+// Host names to IPv4 addresses through the C library, since akikit's
 // sockets take only numeric addresses.
 
 module worker::resolve;
 
-import {with_nul} from akibase::strings::base_string;
-import {parse_ipv4} from akibase::net::socket_address;
+import {with_nul} from akikit::strings::string;
+import {parse_ipv4} from akikit::net::socket_address;
 
 extern struct AddrInfo {
   pub var flags: i32
@@ -19,7 +19,7 @@ extern struct AddrInfo {
 
 extern("getaddrinfo") fn c_getaddrinfo(node: *const c8, service: *const c8, hints: *const AddrInfo,
                                        res: *var *var AddrInfo): i32;
-extern("freeaddrinfo") fn c_freeaddrinfo(res: *var AddrInfo): ();
+extern("freeaddrinfo") fn c_freeaddrinfo(res: *var AddrInfo);
 
 comptime let kAfInet: i32 = 2;
 comptime let kSockStream: i32 = 1;

@@ -1,10 +1,10 @@
 module fields_test;
 
-import {parse, to_string, text} from akibase::text::json;
-import {eprintln} from akibase::logging;
-import {put, merge, str_of, num_of, copy} from wire::fields;
+import {parse, to_string, text} from akikit::text::json;
+import {eprintln} from akikit::logging;
+import {put, merge, str_of, num_of} from wire::fields;
 
-fn check(ok: bool, what: str, var failures&: i32): () {
+fn check(ok: bool, what: str, var failures&: i32) {
   if (!ok) {
     eprintln(what);
     failures += 1;
@@ -20,7 +20,7 @@ pub fn main(): i32 {
   put(e, "kind", text("note"));
   check((str_of(e, "kind") ?? "") == "note", "put replaces", failures);
   check(num_of(e, "missing") == none, "a missing number", failures);
-  let c = copy(e);
+  let c = e.clone();
   put(e, "kind", text("agent"));
   check((str_of(c, "kind") ?? "") == "note", "a copy is independent", failures);
   return failures;

@@ -2,53 +2,52 @@
 
 module worker::transcript;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
 import {entry_id} from worker::entry;
 
 pub struct Transcript : Send {
   pub var turn: String
   pub var session: String
   // The agent reported that the turn failed.
-  pub var failed: bool
+  pub var failed: bool = false
   // A meter the agent reported, as JSON text, until it is sent.
-  pub var usage: String
+  pub var usage: String = String()
   // Tokens and dollars used since the turn last reported them.
-  pub var tokens: f64
-  pub var cost: f64
+  pub var tokens: f64 = 0.0
+  pub var cost: f64 = 0.0
+  pub var turn_cost: f64 = 0.0
   // Claude repeats a message's usage for every block of it: the messages
   // counted, and the tokens counted this turn, which `result` corrects.
-  pub var messages: Vector<String>
-  pub var turn_tokens: f64
+  pub var messages: List<String> = List()
+  pub var turn_tokens: f64 = 0.0
   // Codex's tokens come from its rollout, not from `turn.completed`: its
   // running total when last read.
-  pub var rollout: bool
-  pub var codex_total: f64
-  var count: u32
+  pub var rollout: bool = false
+  pub var codex_total: f64 = 0.0
+  var count: u32 = 0
 
   pub fn Transcript(turn: str, session: str): Transcript;
   pub fn next_id(var self&): String;
   pub fn id_for(self&, local: str): String;
-  pub fn spend(var self&, tokens: f64, cost: f64): ();
+  pub fn spend(var self&, tokens: f64, cost: f64);
 }
 
 fn Transcript::Transcript(turn: str, session: str): Transcript => Transcript {
-  turn: from_str(turn), session: from_str(session), failed: false, usage: String(), tokens: 0.0, cost: 0.0,
-  messages: new::<String>(), turn_tokens: 0.0, rollout: false, codex_total: 0.0, count: 0
+  turn: from_str(turn), session: from_str(session)
 };
 
 // A fresh id for an entry the agent gave none.
 fn Transcript::next_id(var self&): String {
   self.count += 1;
-  var local = from_str("m");
-  local.push_u64(self.count as u64);
-  return entry_id(self.turn.as_str(), local.as_str());
+  return f"{self.turn}.m{self.count}";
 }
 
-fn Transcript::id_for(self&, local: str): String => entry_id(self.turn.as_str(), local);
+fn Transcript::id_for(self&, local: str): String => entry_id(self.turn, local);
 
-fn Transcript::spend(var self&, tokens: f64, cost: f64): () {
+fn Transcript::spend(var self&, tokens: f64, cost: f64) {
   self.tokens += tokens;
   self.cost += cost;
+  self.turn_cost += cost;
   self.turn_tokens += tokens;
 }

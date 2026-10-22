@@ -3,9 +3,9 @@
 
 module usage_test;
 
-import {parse, to_string} from akibase::text::json;
-import {contains} from akibase::strings::string_search;
-import {eprintln} from akibase::logging;
+import {parse, to_string} from akikit::text::json;
+import {contains} from akikit::strings::string_search;
+import {eprintln} from akikit::logging;
 import {meter, claude_meter, claude_usage_meter, codex_meter, opencode_meters, add_zai, add_copilot, iso_millis} from worker::usage;
 
 comptime let kClaude: str = r"""
@@ -43,7 +43,7 @@ pub fn main(): i32 {
   var failures: i32 = 0;
 
   let c = to_string(claude_meter(parse(kClaude)!, 5)!.to_json());
-  // akibase reads 0.03 as 0.030000000000000006, so numbers match by prefix.
+  // akikit reads 0.03 as 0.030000000000000006, so numbers match by prefix.
   check(contains(c.as_str(), "{\"agent\":\"claude\",\"provider\":\"anthropic\",\"plan\":\"\",\"at\":5,\"limits\":[{\"name\":\"5 hours\",\"used\":0.03"),
         "claude five hours", failures);
   check(contains(c.as_str(), "\"resets\":1790794800000},{\"name\":\"7 days\",\"used\":0.43"), "claude seven days", failures);

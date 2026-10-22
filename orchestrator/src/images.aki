@@ -3,15 +3,15 @@
 
 module orchestrator::images;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector} from akibase::containers::vector;
-import {read_file, write_file, rename_file, delete_file, path_exists} from akibase::filesystem::file_util;
-import {system_now} from akibase::time::time;
-import {create_directories} from akibase::filesystem::directory;
-import {join} from akibase::filesystem::path;
-import {trim} from akibase::strings::string_search;
-import {sha256} from akibase::hashing::sha256;
-import {read_bytes, write_bytes} from wire::files;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {read_file, write_file, rename_file, delete_file, path_exists} from akikit::filesystem::file_util;
+import {system_now} from akikit::time::time;
+import {create_directories} from akikit::filesystem::directory;
+import {join} from akikit::filesystem::path;
+import {trim} from akikit::strings::string_search;
+import {sha256} from akikit::hashing::sha256;
+import {read_bytes, write_bytes} from akikit::filesystem::file_util;
 
 // An image, and all of a message's images together, stay small enough that
 // their base64 fits the 8 MiB line a turn travels in.
@@ -46,15 +46,15 @@ pub fn store(data_dir: str, bytes_: bytes, media: str): String? {
     id.push_c8(hex[(b >> 4) as usize]);
     id.push_c8(hex[(b & 15) as usize]);
   }
-  let p = path_of(data_dir, id.as_str());
-  if (path_exists(p.as_str())) {
+  let p = path_of(data_dir, id);
+  if (path_exists(p)) {
     return id;
   }
   let _ = create_directories(join(data_dir, "images").as_str());
   // The type goes first: an image file without one would not be served.
   var type_path = p.clone();
   type_path.push_str(".type");
-  if (let _ = write_file(type_path.as_str(), media)) {
+  if (let _ = write_file(type_path, media)) {
   } else {
     return none;
   }
@@ -62,18 +62,16 @@ pub fn store(data_dir: str, bytes_: bytes, media: str): String? {
   var tmp = p.clone();
   tmp.push_str(".part");
   tmp.push_i64(system_now().unix_nanoseconds());
-  if (!write_bytes(tmp.as_str(), bytes_)) {
-    return none;
-  }
-  if (let _ = rename_file(tmp.as_str(), p.as_str())) {
+  if (let _ = write_bytes(tmp, bytes_)) {} else { return none; }
+  if (let _ = rename_file(tmp, p)) {
     return id;
   }
-  let _ = delete_file(tmp.as_str());
-  return path_exists(p.as_str()) ? id : none;
+  let _ = delete_file(tmp);
+  return path_exists(p) ? id : none;
 }
 
 pub struct Image {
-  pub var data: Vector<u8>
+  pub var data: List<byte>
   pub var media: String
 }
 
@@ -84,11 +82,11 @@ pub fn load(data_dir: str, id: str): Image? {
   let p = path_of(data_dir, id);
   var type_path = p.clone();
   type_path.push_str(".type");
-  let media = read_file(type_path.as_str()) else {
+  let media = read_file(type_path) else {
     return none;
   };
-  let data = read_bytes(p.as_str()) else {
+  let data = read_bytes(p) else {
     return none;
   };
-  return Image { data, media: from_str(trim(media.as_str())) };
+  return Image { data, media: from_str(trim(media)) };
 }

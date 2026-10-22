@@ -4,10 +4,10 @@
 
 module orchestrator::hub;
 
-import {String} from akibase::strings::base_string;
-import {Mutex} from akibase::threading::mutex;
-import {Condvar} from akibase::threading::condition_variable;
-import {unix_time_milliseconds} from akibase::time::time;
+import {String} from akikit::strings::string;
+import {Mutex} from akikit::threading::mutex;
+import {Condvar} from akikit::threading::condition_variable;
+import {unix_time_milliseconds} from akikit::time::time;
 import {Board} from orchestrator::board;
 
 pub struct Hub : Send {

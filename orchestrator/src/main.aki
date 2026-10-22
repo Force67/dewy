@@ -5,27 +5,27 @@
 
 module orchestrator;
 
-import {String, from_str} from akibase::strings::base_string;
-import {new} from akibase::containers::vector;
-import {arg, arg_count} from akibase::command_line;
-import {OptionParser, Options, message} from akibase::option;
-import {TcpListener, bind_to, net_error_message} from akibase::net::tcp;
-import {parse_ipv4, SocketAddress} from akibase::net::socket_address;
-import {get_environment_variable} from akibase::environment_variables;
-import {SharedPointer, make_shared} from akibase::memory::shared_pointer;
-import {Mutex} from akibase::threading::mutex;
-import {Condvar} from akibase::threading::condition_variable;
-import {ThreadPool} from akibase::threading::thread_pool;
-import {spawn} from akibase::threading::thread;
-import {seconds, sleep} from akibase::time::time;
-import {eprintln, print} from akibase::logging;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {arg, arg_count} from akikit::process::command_line;
+import {OptionParser, Options, message} from akikit::process::option;
+import {TcpListener, bind_to, net_error_message} from akikit::net::tcp;
+import {parse_ipv4, SocketAddress} from akikit::net::socket_address;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {Arc, make_arc} from akikit::memory::arc;
+import {Mutex} from akikit::threading::mutex;
+import {Condvar} from akikit::threading::condition_variable;
+import {ThreadPool} from akikit::threading::thread_pool;
+import {spawn} from akikit::threading::thread;
+import {seconds, sleep} from akikit::time::time;
+import {eprintln, print} from akikit::logging;
 import {Board} from orchestrator::board;
 import {Hub, now_ms} from orchestrator::hub;
 import {Pending, load, prepare, write} from orchestrator::snapshot;
 import {AppConnection, serve_app} from orchestrator::api;
 import {DockConnection, serve_worker} from orchestrator::dock;
 
-// Each open app stream and worker link holds a pool thread, and akibase
+// Each open app stream and worker link holds a pool thread, and akikit
 // threads cannot detach, so the pools bound how many there can be.
 comptime let kAppThreads: usize = 48;
 comptime let kDockThreads: usize = 32;
@@ -40,7 +40,7 @@ fn parser(): OptionParser {
 }
 
 pub fn main(): i32 {
-  var args = new::<str>();
+  var args = List::<str>();
   for (let i in 1..arg_count()) {
     args.push(arg(i));
   }
@@ -62,7 +62,7 @@ pub fn main(): i32 {
 }
 
 fn listen(ip: [u8; 4], port: i64): TcpListener? {
-  let at = SocketAddress { ip, port: port as u16 };
+  let at = SocketAddress(ip[0], ip[1], ip[2], ip[3], port as u16);
   let l = bind_to(at) else (let e) {
     eprintln(f"orchestrator: cannot listen on {at.to_string()}: {net_error_message(e)}".as_str());
     return none;
@@ -77,7 +77,7 @@ fn run(o&: Options, token: String): i32 {
   };
   let data = from_str(o.value("data") ?? "data");
   var board = Board();
-  let restored = load(data.as_str(), board);
+  let restored = load(data, board);
   let app = listen(ip, o.int("port") ?? 8787) else {
     return 1;
   };
@@ -86,7 +86,7 @@ fn run(o&: Options, token: String): i32 {
   };
   print(f"orchestrator: {restored} tasks from {data}, app on {app.local_address()!.to_string()}, workers on {docks.local_address()!.to_string()}\n".as_str());
 
-  let hub = make_shared(Hub { board: Mutex::<Board>(board), changed: Condvar(), token, epoch: now_ms(), data: data.clone() });
+  let hub = make_arc(Hub { board: Mutex::<Board>(board), changed: Condvar(), token, epoch: now_ms(), data: data.clone() });
   let keeper = spawn(keep_time, (hub.share(), data));
   let dock = spawn(accept_workers, (docks, hub.share()));
   let pool = ThreadPool(kAppThreads);
@@ -100,7 +100,7 @@ fn run(o&: Options, token: String): i32 {
   return 0;
 }
 
-fn accept_workers(args: (TcpListener, SharedPointer<Hub>)): () {
+fn accept_workers(args: (TcpListener, Arc<Hub>)) {
   let (listener, hub) = args;
   let pool = ThreadPool(kDockThreads);
   while (true) {
@@ -110,7 +110,7 @@ fn accept_workers(args: (TcpListener, SharedPointer<Hub>)): () {
   }
 }
 
-fn keep_time(args: (SharedPointer<Hub>, String)): () {
+fn keep_time(args: (Arc<Hub>, String)) {
   let (hub, data) = args;
   while (true) {
     sleep(seconds(2));
@@ -119,9 +119,9 @@ fn keep_time(args: (SharedPointer<Hub>, String)): () {
       b.sweep(now);
       return prepare(b);
     });
-    if (!write(data.as_str(), pending)) {
+    if (!write(data, pending)) {
       eprintln("orchestrator: could not save every task");
     }
-    hub.get().changed.notify_all();
+    if (!pending.names.is_empty()) { hub.get().changed.notify_all(); }
   }
 }

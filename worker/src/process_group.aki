@@ -1,0 +1,64 @@
+// Identify members before signaling a group whose supervisor disappeared.
+module worker::process_group;
+
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {list_directory} from akikit::filesystem::directory;
+import {read_file} from akikit::filesystem::file_util;
+import {split_last_once} from akikit::strings::string_search;
+import {split_whitespace} from akikit::strings::string_util;
+import {parse_i32} from akikit::strings::string_to_number;
+import {send_signal, kSignalTerminate, kSignalKill} from akikit::process::child;
+import {milliseconds, seconds, sleep, now} from akikit::time::time;
+
+struct Member {
+  pub var pid: i32
+  pub var start: String
+  pub var group: i32
+}
+
+fn identity(pid: i32): Member? {
+  let stat = read_file(f"/proc/{pid}/stat") else { return none; };
+  let (_, rest) = split_last_once(stat, ')') else { return none; };
+  let fields = split_whitespace(rest);
+  if (fields.len() < 20) { return none; }
+  return Member { pid, start: from_str(fields[19]), group: parse_i32(fields[2]) ?? 0 };
+}
+
+fn members(group: i32): List<Member> {
+  var out = List::<Member>();
+  for (let name in list_directory("/proc") ?? List::<String>()) {
+    let pid = parse_i32(name) else { continue; };
+    if (let member = identity(pid)) {
+      if (member.group == group) { out.push(member); }
+    }
+  }
+  return out;
+}
+
+fn anchored(group: i32, known&: [Member]): bool {
+  for (let member in known) {
+    if (let current = identity(member.pid)) {
+      if (current.start == member.start && current.group == group) { return true; }
+    }
+  }
+  return false;
+}
+
+pub fn terminate_group(pid: i32, start: str) {
+  let leader = identity(pid) else { return; };
+  if (leader.start != start || leader.group != pid) { return; }
+  let known = members(pid);
+  let current = identity(pid) else { return; };
+  if (current.start != start || current.group != pid) { return; }
+  let _ = send_signal(-pid, kSignalTerminate);
+  let began = now();
+  while (began.elapsed() < seconds(2)) {
+    if (!anchored(pid, known.as_slice())) { return; }
+    sleep(milliseconds(100));
+  }
+  // The leader may already have exited and been reaped. An original
+  // member with the same pid/start and group still anchors this PGID;
+  // a wholly unrelated group that reused the number must not be killed.
+  if (anchored(pid, known.as_slice())) { let _ = send_signal(-pid, kSignalKill); }
+}

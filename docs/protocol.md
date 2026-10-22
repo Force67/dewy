@@ -4,7 +4,7 @@
 
 A worker opens a TCP connection to the orchestrator's worker port and both sides send one JSON object per line.
 
-The worker first sends its hello. `running` lists the tasks it still runs, so the orchestrator can fail tasks whose turn died with an earlier worker:
+The worker first sends its hello. `running` includes tasks recovered from durable tmux turn records, even when their final output still needs replaying, so the orchestrator can fail tasks whose turn died with an earlier worker:
 
 ```json
 {"type":"hello","token":"…","box":"forge","host":"forge","os":"NixOS 26.11","agents":["claude","codex","opencode"],"poweroff":true,
@@ -29,12 +29,14 @@ The worker reports entries, the agent's session id, a task's title, the end of a
 {"type":"state","task":"7","state":"idle"}
 {"type":"title","task":"8","title":"Android app flash test"}
 {"type":"sessions","sessions":[{"id":"d0806beb-…","pid":112882,"project":"/home/me/Projects/dewy","name":"dewy-c4","state":"idle","started":1790758900000}]}
-{"type":"spend","task":"7","provider":"anthropic","tokens":21447,"cost":0.093}
+{"type":"spend","task":"7","turn":"t3","provider":"anthropic","tokens":21447,"cost":0.093}
 {"type":"usage","meters":[{"agent":"codex","provider":"openai","plan":"prolite","at":1790779257882,"limits":[{"name":"7 days","used":0.78,"resets":1791143267000}],"spend":[]}]}
 {"type":"stats","stats":{"load":0.8,"cpus":16,"memTotal":67345383424,"memUsed":23318081536,"uptime":42022}}
 ```
 
-An entry is `agent`, `user`, `tool`, `note`, or `error`. An entry whose id is already in the thread updates that entry, which is how a tool call gets its result. A turn ends `idle` or `failed`.
+An entry is `agent`, `user`, `tool`, `note`, or `error`. An entry whose id is already in the thread updates that entry, which is how a tool call gets its result. A turn ends `idle` or `failed`, or `stopped` after cancellation.
+
+A `spend` message with `turn` reports cumulative tokens and cost for that turn. The orchestrator adds only increases over its saved totals for the same task and turn, so replay after a worker restart cannot charge twice. Older workers without `turn` continue to report increments. Upgrade the orchestrator before starting workers that use tmux.
 
 ## App and orchestrator
 

@@ -1,0 +1,41 @@
+module spend_replay_test;
+
+import {parse, array, path} from akikit::text::json;
+import {eprintln} from akikit::logging;
+import {num_of} from wire::fields;
+import {Board} from orchestrator::board;
+
+fn check(ok: bool, label: str, var failures&: i32) {
+  if (!ok) { eprintln(label); failures += 1; }
+}
+
+pub fn main(): i32 {
+  var failures: i32 = 0;
+  var b = Board();
+  let hello = parse(r#"{"box":"test","agents":["claude"],"running":["1"]}"#)!;
+  let _ = b.attach(hello, 1);
+  let id = b.create_task("test", "/tmp", "claude", "", "test", array(), false, 1)!;
+  let report = parse(r#"{"type":"spend","task":"1","turn":"t1","provider":"anthropic","tokens":100,"cost":0.25}"#)!;
+  b.apply("test", report, 2);
+  b.apply("test", report, 3);
+  b.apply("test", parse(r#"{"type":"spend","task":"1","turn":"t1","tokens":50,"cost":0.1}"#)!, 4);
+  b.apply("test", parse(r#"{"type":"spend","task":"1","turn":"t2","tokens":200,"cost":0.5}"#)!, 5);
+  b.apply("test", report, 6);
+  let saved = b.task_json(id.as_str())!;
+  let spent& = path(saved, "spend")!;
+  check(num_of(spent, "tokens") == 300.0, "replay of an older turn does not charge twice", failures);
+  check(num_of(spent, "cost") == 0.75, "replayed cost does not charge twice", failures);
+
+  var restored = Board();
+  let _ = restored.attach(hello, 7);
+  restored.restore_task(saved);
+  restored.apply("test", report, 8);
+  restored.apply("test", parse(r#"{"type":"spend","task":"1","turn":"t1","tokens":150,"cost":0.5}"#)!, 9);
+  // Workers predating tmux still report deltas without a turn id.
+  restored.apply("test", parse(r#"{"type":"spend","task":"1","tokens":10,"cost":0.25}"#)!, 10);
+  let t = restored.task_json(id.as_str())!;
+  let total& = path(t, "spend")!;
+  check(num_of(total, "tokens") == 360.0, "saved turn totals survive an orchestrator restart", failures);
+  check(num_of(total, "cost") == 1.25, "only the cumulative increase and legacy delta are charged", failures);
+  return failures;
+}

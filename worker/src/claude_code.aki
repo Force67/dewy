@@ -4,16 +4,17 @@
 
 module worker::claude_code;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Command} from akibase::process::child;
-import {Json, object, array, set, push, text, to_string, get, as_array, as_str, path} from akibase::text::json;
+import {Invocation, args} from worker::invocation;
+
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, object, array, set, push, text, to_string, get, as_array, as_str, path} from akikit::text::json;
 import {str_of, num_of, bool_of} from wire::fields;
 import {first_line} from wire::clip;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 import {claude_meter} from worker::usage;
-import {unix_time_milliseconds} from akibase::time::time;
+import {unix_time_milliseconds} from akikit::time::time;
 
 // Every token a Claude usage counts, cached ones included.
 fn usage_tokens(u&: Json): f64 =>
@@ -22,33 +23,28 @@ fn usage_tokens(u&: Json): f64 =>
 
 // With `on_stdin`, the prompt comes as a stream-json user message on
 // standard input, which is how images reach Claude.
-pub fn claude_command(text: str, session: str, yolo: bool, on_stdin: bool): Command {
-  var c = Command("claude");
+pub fn claude_command(text: str, session: str, yolo: bool, on_stdin: bool): Invocation {
+  var c = Invocation("claude");
   c.arg("-p");
   if (on_stdin) {
-    c.arg("--input-format");
-    c.arg("stream-json");
+    args(c, "--input-format", "stream-json");
   } else {
     c.arg(text);
   }
-  c.arg("--output-format");
-  c.arg("stream-json");
-  c.arg("--verbose");
+  args(c, "--output-format", "stream-json", "--verbose");
   if (yolo) {
     c.arg("--dangerously-skip-permissions");
   } else {
-    c.arg("--permission-mode");
-    c.arg("acceptEdits");
+    args(c, "--permission-mode", "acceptEdits");
   }
   if (#session > 0) {
-    c.arg("--resume");
-    c.arg(session);
+    args(c, "--resume", session);
   }
   return c;
 }
 
-pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
-  var out = new::<Json>();
+pub fn read_claude(var t&: Transcript, line&: Json): List<Json> {
+  var out = List::<Json>();
   let kind = str_of(line, "type") ?? "";
   if (let s = str_of(line, "session_id")) {
     t.session = from_str(s);
@@ -57,7 +53,7 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
     if (let id = str_of(get(line, "message") ?? Json::Null, "id")) {
       var seen = false;
       for (let m& in t.messages) {
-        if (m.as_str() == id) {
+        if (m == id) {
           seen = true;
         }
       }
@@ -81,11 +77,11 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
       } else if (block == "tool_use") {
         let id = t.id_for(str_of(b, "id") ?? "");
         let name = str_of(b, "name") ?? "tool";
-        out.push(tool_started(id.as_str(), name, summary(get(b, "input") ?? Json::Null).as_str()));
+        out.push(tool_started(id, name, summary(get(b, "input") ?? Json::Null).as_str()));
       } else if (block == "tool_result") {
         let id = t.id_for(str_of(b, "tool_use_id") ?? "");
         let ok = !(bool_of(b, "is_error") ?? false);
-        var done = tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str());
+        var done = tool_finished(id, ok, result_text(get(b, "content") ?? Json::Null).as_str());
         with_images(done, images_in(get(b, "content") ?? Json::Null));
         out.push(done);
       }
@@ -110,9 +106,9 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
         let what = summary(get(d, "tool_input") ?? Json::Null);
         if (what.len() > 0) {
           note.push_str(": ");
-          note.push_str(what.as_str());
+          note.push_str(what);
         }
-        out.push(said(t.next_id().as_str(), "note", note.as_str()));
+        out.push(said(t.next_id().as_str(), "note", note));
       }
     }
   }
@@ -124,8 +120,8 @@ pub fn read_claude(var t&: Transcript, line&: Json): Vector<Json> {
 // person typed has origin "human"; injected context (isMeta) and subagent
 // traffic (isSidechain) stay out. Ids come from the transcript, so reading
 // a line twice updates the same entries.
-pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
-  var out = new::<Json>();
+pub fn read_terminal(var t&: Transcript, line&: Json): List<Json> {
+  var out = List::<Json>();
   if ((bool_of(line, "isSidechain") ?? false) || (bool_of(line, "isMeta") ?? false)) {
     return out;
   }
@@ -142,7 +138,7 @@ pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
       let pasted = images_in(get(a, "prompt") ?? Json::Null);
       let has_images = #as_array(pasted)! > 0;
       if ((as_str(path(a, "origin.kind") ?? Json::Null) ?? "") == "human" && (prompt.len() > 0 || has_images)) {
-        var e = said(t.id_for(uuid).as_str(), "user", prompt.as_str());
+        var e = said(t.id_for(uuid).as_str(), "user", prompt);
         with_images(e, pasted);
         out.push(e);
       }
@@ -170,18 +166,18 @@ pub fn read_terminal(var t&: Transcript, line&: Json): Vector<Json> {
     if (block == "text") {
       let body = str_of(b, "text") ?? "";
       if (kind == "assistant" && #body > 0) {
-        out.push(said(t.id_for(local.as_str()).as_str(), "agent", body));
+        out.push(said(t.id_for(local).as_str(), "agent", body));
       } else if (kind == "user" && human && #body > 0) {
-        out.push(said(t.id_for(local.as_str()).as_str(), "user", body));
+        out.push(said(t.id_for(local).as_str(), "user", body));
       }
     } else if (block == "tool_use" && kind == "assistant") {
       let id = t.id_for(str_of(b, "id") ?? "");
       let name = str_of(b, "name") ?? "tool";
-      out.push(tool_started(id.as_str(), name, summary(get(b, "input") ?? Json::Null).as_str()));
+      out.push(tool_started(id, name, summary(get(b, "input") ?? Json::Null).as_str()));
     } else if (block == "tool_result" && kind == "user") {
       let id = t.id_for(str_of(b, "tool_use_id") ?? "");
       let ok = !(bool_of(b, "is_error") ?? false);
-      var done = tool_finished(id.as_str(), ok, result_text(get(b, "content") ?? Json::Null).as_str());
+      var done = tool_finished(id, ok, result_text(get(b, "content") ?? Json::Null).as_str());
       with_images(done, images_in(get(b, "content") ?? Json::Null));
       out.push(done);
     }
@@ -228,7 +224,7 @@ fn images_in(content&: Json): Json {
   return out;
 }
 
-fn with_images(var e&: Json, images: Json): () {
+fn with_images(var e&: Json, images: Json) {
   if (let list = as_array(images)) {
     if (#list > 0) {
       set(e, "images", images);
