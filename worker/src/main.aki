@@ -5,38 +5,42 @@
 
 module worker;
 
-import {String, from_str} from akibase::strings::base_string;
-import {new} from akibase::containers::vector;
-import {arg, arg_count} from akibase::command_line;
-import {OptionParser, Options, message} from akibase::option;
-import {connect_to} from akibase::net::tcp;
-import {SocketAddress} from akibase::net::socket_address;
-import {get_environment_variable} from akibase::environment_variables;
-import {split} from akibase::strings::string_util;
-import {split_last_once} from akibase::strings::string_search;
-import {parse_u32} from akibase::strings::string_to_number;
-import {milliseconds, seconds, sleep, now} from akibase::time::time;
-import {eprintln, print} from akibase::logging;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {arg, arg_count} from akikit::process::command_line;
+import {OptionParser, Options, message} from akikit::process::option;
+import {connect_to} from akikit::net::tcp;
+import {SocketAddress} from akikit::net::socket_address;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {split} from akikit::strings::string_util;
+import {split_last_once} from akikit::strings::string_search;
+import {parse_u32} from akikit::strings::string_to_number;
+import {milliseconds, seconds, sleep, now} from akikit::time::time;
+import {eprintln, print} from akikit::logging;
 import {LineStream} from wire::line_stream;
 import {Crew} from worker::crew;
 import {hello, hostname, models, stats} from worker::inventory;
 import {terminal_sessions, sessions_message} from worker::terminal;
-import {Json, to_string} from akibase::text::json;
+import {Json, to_string} from akikit::text::json;
 import {resolve_ipv4} from worker::resolve;
 import {MeasureJob, measure_forever} from worker::measure;
-import {spawn} from akibase::threading::thread;
+import {spawn} from akikit::threading::thread;
+import {open_store, default_dir} from worker::store;
+import {available, supervise, socket_path} from worker::tmux;
 
 fn parser(): OptionParser {
   var p = OptionParser("worker", "Runs coding agents on this box for the dewy orchestrator.");
   p.value("orchestrator", 'o', "HOST:PORT", "where the orchestrator takes workers (default $DEWY_ORCHESTRATOR)");
   p.value("name", 'n', "NAME", "the box's name in the app (default the host name)");
   p.list("projects", 'p', "DIR", "a git repository, or a directory of them (default $DEWY_PROJECTS, colon-separated)");
+  p.value("data", none, "DIR", "durable worker state (default $XDG_STATE_HOME/dewy/workers/<hex box name>)");
   p.flag("yolo", none, "let agents run any command without asking; only on boxes you can wipe");
   return p;
 }
 
 pub fn main(): i32 {
-  var args = new::<str>();
+  if (arg_count() == 3 && arg(1) == "__dewy-run") { return supervise(arg(2)); }
+  var args = List::<str>();
   for (let i in 1..arg_count()) {
     args.push(arg(i));
   }
@@ -59,7 +63,7 @@ fn run(o&: Options): i32 {
     return 2;
   }
   let target = from_str(o.value("orchestrator") ?? (get_environment_variable("DEWY_ORCHESTRATOR") ?? String()).as_str());
-  let (host, port_text) = split_last_once(target.as_str(), ':') else {
+  let (host, port_text) = split_last_once(target, ':') else {
     eprintln("worker: pass --orchestrator HOST:PORT");
     return 2;
   };
@@ -69,33 +73,44 @@ fn run(o&: Options): i32 {
     return 2;
   }
   let name = from_str(o.value("name") ?? hostname().as_str());
-  var roots = new::<String>();
+  var roots = List::<String>();
   for (let r& in o.values("projects")) {
     roots.push(r.clone());
   }
   if (roots.is_empty()) {
     let env = get_environment_variable("DEWY_PROJECTS") ?? String();
-    for (let r in split(env.as_str(), ":")) {
+    for (let r in split(env, ":")) {
       if (#r > 0) {
         roots.push(from_str(r));
       }
     }
   }
 
-  var crew = Crew(o.flag("yolo"));
+  if (!available()) {
+    eprintln("worker: tmux is required; install tmux and put it on PATH");
+    return 2;
+  }
+  let data = from_str(o.value("data") ?? default_dir(name).as_str());
+  let store = open_store(data) else {
+    eprintln("worker: cannot lock the state directory; check permissions and whether another worker is using it");
+    return 2;
+  };
+  print(f"worker: tmux socket {socket_path(store.dir)}\n".as_str());
+  var crew = Crew(o.flag("yolo"), store.dir);
+  crew.recover();
   let _measuring = spawn(measure_forever, MeasureJob { outbox: crew.share_outbox() });
   var pause = seconds(1);
   while (true) {
     let listed = models();
     if (let ip = resolve_ipv4(host)) {
-      let at = SocketAddress { ip, port: port as u16 };
+      let at = SocketAddress(ip[0], ip[1], ip[2], ip[3], port as u16);
       if (let stream = connect_to(at)) {
         pause = seconds(1);
         var s = stream;
         let _ = s.set_read_timeout(milliseconds(200));
         let _ = s.set_write_timeout(seconds(10));
         print(f"worker: {name} linked to {at.to_string()}\n".as_str());
-        serve(LineStream(s), crew, token.as_str(), name.as_str(), roots.as_slice(), listed);
+        serve(LineStream(s), crew, token, name, roots.as_slice(), listed);
         eprintln("worker: lost the orchestrator");
       }
     } else {
@@ -108,7 +123,7 @@ fn run(o&: Options): i32 {
 }
 
 // Relays until the link breaks.
-fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [String], models: Json): () {
+fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [String], models: Json) {
   var l = link;
   if (let _ = l.send(hello(token, name, roots, models, crew.running_tasks()))) {
   } else {
@@ -129,19 +144,20 @@ fn serve(link: LineStream, var crew&: Crew, token: str, name: str, roots&: [Stri
     var lines = crew.collect();
     while (lines.len() > 0) {
       let line = lines.remove(0);
-      if (let _ = l.send_text(line.as_str())) {
+      if (let _ = l.send_text(line)) {
       } else {
         lines.insert(0, line);
         crew.put_back(lines);
         return;
       }
     }
+    crew.sent();
     if (!scanned || last_scan.elapsed() > seconds(5)) {
       scanned = true;
       last_scan = now();
       let list = to_string(sessions_message(terminal_sessions()));
       if (!list.eq(sessions)) {
-        if (let _ = l.send_text(list.as_str())) {
+        if (let _ = l.send_text(list)) {
           sessions = list;
         } else {
           return;

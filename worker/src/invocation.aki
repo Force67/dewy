@@ -1,0 +1,31 @@
+// An agent's argv, shared by the adapters and the tmux launcher.
+module worker::invocation;
+
+import {String, from_str} from akikit::strings::string;
+import {Command} from akikit::process::child;
+import {List} from akikit::containers::list;
+
+pub struct Invocation {
+  pub var args: List<String>
+
+  pub fn Invocation(program: str): Invocation;
+  pub fn arg(var self&, value: str) => self.args.push(from_str(value));
+}
+
+fn Invocation::Invocation(program: str): Invocation {
+  var args = List::<String>();
+  args.push(from_str(program));
+  return Invocation { args };
+}
+
+// Type packs keep related options together without building a temporary list.
+pub fn args(var invocation&: Invocation, values: str...) {
+  for (let value in values) { invocation.arg(value); }
+}
+
+// Construct argv directly; prompts and paths never pass through a shell.
+pub fn command_of(invocation&: Invocation): Command {
+  var c = Command(invocation.args[0].as_str());
+  for (let arg in invocation.args.as_slice()[1..]) { c.arg(arg); }
+  return c;
+}

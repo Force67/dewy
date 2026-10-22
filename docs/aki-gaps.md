@@ -1,27 +1,25 @@
 # aki gaps
 
-What dewy needed from aki and akibase that was missing or surprising, and how it works around each. Checked against akiv4 at `a550a4c`.
+Dewy's backend now targets Aki 0.6.0 and akikit. The migration was checked with the 0.6.0 compiler and upstream akikit at `4a19769`.
 
-## Toolchain
+## Resolved since the original implementation
 
-- **No x86-64 Linux release.** Releases ship for aarch64 only, and the flake packages no `akiko`. dewy's README builds one with `tools/seed_from_source.sh` and `tools/bootstrap.sh`.
+- Linux x86-64 releases are available, alongside aarch64; building the compiler from source is optional.
+- `Json` and `List` implement `Clone`. Dewy calls `clone()` and akikit's binary `read_bytes` and `write_bytes` directly; the old compatibility wrappers have been removed.
+- `File` reads and writes descriptors directly on Linux and macOS. The old stdio buffering workaround is no longer needed there.
+- The socket library supports IPv6 as well as IPv4. Dewy currently keeps its existing IPv4 listener and resolver behavior.
+- Condition variables support timed waits. Event streams now wait until a change or their next keepalive deadline; the timekeeping thread only notifies them after a board change.
+- `??` now binds more tightly than comparisons. Existing explicitly parenthesized expressions retain their meaning.
+- Field defaults, enum methods, type aliases, type packs, pattern guards, and `try` keep constructors, argument lists, and file operations concise. Bulk `List` operations handle buffer copies and ordered entry drains.
+- Scoped temporary directories clean up command output and quota headers on every return path. Command probes retain deadlines because akikit's `capture::output` waits indefinitely.
 
-## akibase
+## Remaining constraints and choices
 
-- **`Json` is not `Send`.** The union lists no capabilities, so no struct holding a `Json` can live behind a `Mutex` shared between threads. The orchestrator's board keeps entries and box details as JSON text and parses them when it builds a reply (`orchestrator/src/board.aki`).
-- **`Json` has no clone and no way to replace a member.** `set` appends, so a second `set` of a key leaves two. `wire/src/fields.aki` adds `copy`, `put`, and `merge`.
-- **`Command` redirects standard streams only to paths.** There is no pipe to read a child's output while it runs. The worker makes a named pipe with `mkfifo` and redirects stdout into it (`worker/src/fifo.aki`).
-- **`File` reads through stdio.** `fread` waits until the buffer is full, so a line from a slow writer never arrives. The worker calls `read(2)` on the descriptor.
-- **`Command::spawn` waits for the child's exec.** The child opens its redirect targets before exec, and opening a FIFO for writing blocks until a reader exists, so a reader that opens after `spawn` deadlocks. The worker opens the read end with `O_NONBLOCK` first and clears the flag with `fcntl` after the spawn.
-- **No name resolution.** `connect` takes numeric IPv4 addresses only. The worker binds `getaddrinfo` itself (`worker/src/resolve.aki`).
-- **No TLS and no HTTP client.** Everything speaks plain HTTP or plain TCP; TLS belongs to a proxy or a tailnet.
-- **`http::response_head` always writes `Content-Length` and `Connection: close`.** A streamed response such as server-sent events needs its own head (`orchestrator/src/stream.aki`).
-- **Threads cannot detach and `Thread` has no `try_join`.** Dropping a `Thread` joins it. Long-lived connections run on fixed `ThreadPool`s, whose size caps how many app streams and workers can be connected at once.
-- **`Condvar::wait_change` has no timeout.** The event streams must ping idle clients, so the orchestrator's timekeeping thread notifies every two seconds to wake them.
-- **IPv4 only** in `akibase::net`.
-
-## Language
-
-- **`a ?? b == c` parses as `a ?? (b == c)`.** Write `(a ?? b) == c`.
-- **Fields and methods share one namespace**, so a struct cannot have a field `seq` and a method `seq()`.
-- **Free functions in a struct's own module cannot build it or touch private fields**; they go through a constructor or a method.
+- **`Json` is not `Send`.** Shared board and outbox values still keep JSON as text.
+- **JSON `set` appends rather than replacing.** `wire::fields::put` and `merge` retain replacement semantics.
+- **`Command` redirects streams to paths.** Worker turns now write regular files under tmux; the FIFO workaround has been removed.
+- **No file seek method.** `worker::tail` uses `lseek` to skip existing transcript content and efficiently read the last part of large usage rollouts. It also follows growing output files without reopening them.
+- **No host name lookup in the socket address parser.** The worker retains its `getaddrinfo` binding.
+- **No TLS or HTTP client in akikit.** Dewy still relies on a proxy or tailnet for transport security and curl for provider usage queries.
+- **Threads have no detach or try_join.** The orchestrator retains fixed thread pools for long-lived connections.
+- **HTTP response heads include Content-Length and Connection: close.** Event streams retain their custom response head.

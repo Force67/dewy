@@ -5,22 +5,21 @@
 
 module worker::measure;
 
-import {String, from_str, with_nul, str_as_bytes} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Command} from akibase::process::child;
-import {Json, array, push, parse, get, as_array, to_string} from akibase::text::json;
-import {SharedPointer} from akibase::memory::shared_pointer;
-import {Mutex} from akibase::threading::mutex;
-import {read_file, delete_file} from akibase::filesystem::file_util;
-import {join} from akibase::filesystem::path;
-import {get_environment_variable} from akibase::environment_variables;
-import {utf8_lossy} from akibase::text::code_convert;
-import {lines} from akibase::strings::string_util;
-import {contains} from akibase::strings::string_search;
-import {seconds, sleep, unix_time_milliseconds} from akibase::time::time;
+import {String, from_str, with_nul, str_as_bytes} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Command} from akikit::process::child;
+import {Json, array, push, parse, get, as_array, to_string} from akikit::text::json;
+import {read_file} from akikit::filesystem::file_util;
+import {join} from akikit::filesystem::path;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {utf8_lossy} from akikit::text::code_convert;
+import {lines} from akikit::strings::string_util;
+import {contains} from akikit::strings::string_search;
+import {seconds, sleep, unix_time_milliseconds} from akikit::time::time;
 import {str_of, num_of} from wire::fields;
-import {Outbox} from worker::turn;
-import {temp_path, output_of} from worker::command;
+import {Outbox, SharedOutbox} from worker::turn;
+import {create_temp_dir} from akikit::filesystem::scoped_temp_dir;
+import {output_of} from worker::command;
 import {on_path} from worker::inventory;
 import {newest_rollouts} from worker::codex;
 import {last_bytes} from worker::tail;
@@ -30,10 +29,10 @@ import {Meter, kSpendWindows, meter, claude_usage_meter, codex_meter, opencode_m
 comptime let kTailBytes: usize = 1 << 20;
 
 pub struct MeasureJob : Send {
-  pub var outbox: SharedPointer<Mutex<Outbox>>
+  pub var outbox: SharedOutbox
 }
 
-pub fn measure_forever(job: MeasureJob): () {
+pub fn measure_forever(job: MeasureJob) {
   while (true) {
     var meters = array();
     if (on_path("claude")) {
@@ -56,7 +55,7 @@ pub fn measure_forever(job: MeasureJob): () {
     }
     if (let list = as_array(meters)) {
       if (#list > 0) {
-        job.outbox.get().with_arg(to_string(usage_message(meters)), fn(o: &var Outbox, line: String): () {
+        job.outbox.get().with_arg(to_string(usage_message(meters)), fn(o: &var Outbox, line: String) {
           o.measured = line;
         });
       }
@@ -72,10 +71,10 @@ fn home(): String => get_environment_variable("HOME") ?? String();
 // still report the limits meanwhile.
 fn claude_limits(): Meter? {
   let dir = get_environment_variable("CLAUDE_CONFIG_DIR") ?? join(home().as_str(), ".claude");
-  let text = read_file(join(dir.as_str(), ".credentials.json").as_str()) else (let e) {
+  let text = read_file(join(dir, ".credentials.json").as_str()) else (let e) {
     return none;
   };
-  let creds = parse(text.as_str()) else {
+  let creds = parse(text) else {
     return none;
   };
   let login = get(creds, "claudeAiOauth") else {
@@ -91,7 +90,7 @@ fn claude_limits(): Meter? {
   var headers = from_str("Authorization: Bearer ");
   headers.push_str(token);
   headers.push_str("\nanthropic-beta: oauth-2025-04-20\nAccept: application/json");
-  let answer = fetch("https://api.anthropic.com/api/oauth/usage", headers.as_str()) else {
+  let answer = fetch("https://api.anthropic.com/api/oauth/usage", headers) else {
     return none;
   };
   return claude_usage_meter(answer, now);
@@ -103,7 +102,7 @@ fn codex_limits(): Meter? {
   var best: Meter? = none;
   var best_at: i64 = -1;
   for (let file& in newest_rollouts(3)) {
-    if (let m = last_rate_limits(file.as_str())) {
+    if (let m = last_rate_limits(file)) {
       if (m.at > best_at) {
         best_at = m.at;
         best = m;
@@ -114,7 +113,7 @@ fn codex_limits(): Meter? {
 }
 
 extern("openat") fn c_openat(dir: i32, path: *const c8, flags: i32, mode: u32): i32;
-extern("write") fn c_write(fd: i32, p: *const u8, n: usize): i64;
+extern("write") fn c_write(fd: i32, p: *const byte, n: usize): i64;
 extern("close") fn c_close(fd: i32): i32;
 
 comptime let kCurrentDir: i32 = -100;
@@ -144,7 +143,7 @@ fn last_rate_limits(file: str): Meter? {
   };
   let tail = utf8_lossy(bytes.as_slice());
   var found: Meter? = none;
-  for (let line in lines(tail.as_str())) {
+  for (let line in lines(tail)) {
     if (contains(line, "\"rate_limits\"")) {
       if (let j = parse(line)) {
         if (let m = codex_meter(j)) {
@@ -168,35 +167,35 @@ fn spend_query(now: i64): String {
   return q;
 }
 
-fn opencode_usage(): Vector<Meter> {
+fn opencode_usage(): List<Meter> {
   let now = unix_time_milliseconds();
-  var meters = new::<Meter>();
+  var meters = List::<Meter>();
   var c = Command("opencode");
   c.arg("db");
   c.arg("--format");
   c.arg("json");
   c.arg(spend_query(now).as_str());
-  if (let out = output_of(c, "spend")) {
-    if (let rows = parse(out.as_str())) {
+  if (let out = output_of(c)) {
+    if (let rows = parse(out)) {
       meters = opencode_meters(rows, now);
     }
   }
   let data = join(home().as_str(), ".local/share/opencode");
-  let auth = parse((read_file(join(data.as_str(), "auth.json").as_str()) ?? String()).as_str()) ?? Json::Null;
-  let accounts = parse((read_file(join(data.as_str(), "account.json").as_str()) ?? String()).as_str()) ?? Json::Null;
+  let auth = parse((read_file(join(data, "auth.json").as_str()) ?? String()).as_str()) ?? Json::Null;
+  let accounts = parse((read_file(join(data, "account.json").as_str()) ?? String()).as_str()) ?? Json::Null;
   if (let key = secret(auth, accounts, "zai-coding-plan", "key")) {
     var header = from_str("Authorization: ");
-    header.push_str(key.as_str());
-    if (let answer = fetch("https://api.z.ai/api/monitor/usage/quota/limit", header.as_str())) {
+    header.push_str(key);
+    if (let answer = fetch("https://api.z.ai/api/monitor/usage/quota/limit", header)) {
       let i = meter_for(meters, "zai-coding-plan", now);
       add_zai(meters[i], answer);
     }
   }
   if (let token = secret(auth, accounts, "github-copilot", "refresh")) {
     var header = from_str("Authorization: token ");
-    header.push_str(token.as_str());
+    header.push_str(token);
     header.push_str("\nUser-Agent: dewy");
-    if (let answer = fetch("https://api.github.com/copilot_internal/user", header.as_str())) {
+    if (let answer = fetch("https://api.github.com/copilot_internal/user", header)) {
       let i = meter_for(meters, "github-copilot", now);
       add_copilot(meters[i], answer);
     }
@@ -205,9 +204,9 @@ fn opencode_usage(): Vector<Meter> {
 }
 
 // Where the provider's meter is, added when it spent nothing yet.
-fn meter_for(var meters&: Vector<Meter>, provider: str, now: i64): usize {
+fn meter_for(var meters&: List<Meter>, provider: str, now: i64): usize {
   for (let i in 0usize..meters.len()) {
-    if (meters[i].provider.as_str() == provider) {
+    if (meters[i].provider == provider) {
       return i;
     }
   }
@@ -245,26 +244,20 @@ fn secret(auth&: Json, accounts&: Json, provider: str, field: str): String? {
 // GETs `url` with curl, the headers in a file only this user reads, so no
 // key shows on a command line.
 fn fetch(url: str, headers: str): Json? {
-  let file = temp_path("headers");
-  var body = from_str(headers);
-  body.push_c8('\n');
-  if (!write_private(file.as_str(), body.as_str())) {
+  let dir = create_temp_dir("dewy-quota") else { return none; };
+  let file = f"{dir.path()}/headers";
+  if (!write_private(file, f"{headers}\n")) {
     return none;
   }
-  var at = from_str("@");
-  at.push_str(file.as_str());
+  let at = f"@{file}";
   var c = Command("curl");
   c.arg("-s");
   c.arg("-f");
   c.arg("-m");
   c.arg("15");
   c.arg("-H");
-  c.arg(at.as_str());
+  c.arg(at);
   c.arg(url);
-  let out = output_of(c, "quota");
-  let _ = delete_file(file.as_str());
-  if (let text = out) {
-    return parse(text.as_str());
-  }
-  return none;
+  let output = output_of(c) else { return none; };
+  return parse(output);
 }

@@ -4,51 +4,47 @@
 
 module worker::codex;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Command} from akibase::process::child;
-import {Json, get, as_array, path, parse} from akibase::text::json;
+import {Invocation, args} from worker::invocation;
+
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, get, as_array, path, parse} from akikit::text::json;
 import {last_bytes} from worker::tail;
-import {utf8_lossy} from akibase::text::code_convert;
-import {lines} from akibase::strings::string_util;
+import {utf8_lossy} from akikit::text::code_convert;
+import {lines} from akikit::strings::string_util;
 import {Meter, codex_meter} from worker::usage;
-import {list_directory} from akibase::filesystem::directory;
-import {join} from akibase::filesystem::path;
-import {get_environment_variable} from akibase::environment_variables;
-import {ends_with, starts_with} from akibase::strings::string_search;
-import {sort} from akibase::algorithm;
+import {list_directory} from akikit::filesystem::directory;
+import {join} from akikit::filesystem::path;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {ends_with, starts_with} from akikit::strings::string_search;
+import {sort} from akikit::algorithm;
 import {str_of, num_of} from wire::fields;
-import {find} from akibase::strings::string_search;
+import {find} from akikit::strings::string_search;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 
-pub fn codex_command(text: str, session: str, yolo: bool, images&: [String]): Command {
-  var c = Command("codex");
+pub fn codex_command(text: str, session: str, yolo: bool, images&: [String]): Invocation {
+  var c = Invocation("codex");
   c.arg("exec");
   if (#session > 0) {
-    c.arg("resume");
-    c.arg(session);
+    args(c, "resume", session);
   }
-  c.arg("--json");
-  c.arg("--skip-git-repo-check");
+  args(c, "--json", "--skip-git-repo-check");
   if (yolo) {
     c.arg("--dangerously-bypass-approvals-and-sandbox");
   } else {
-    c.arg("-c");
-    c.arg("sandbox_mode=\"workspace-write\"");
+    args(c, "-c", "sandbox_mode=\"workspace-write\"");
   }
   for (let p& in images) {
-    c.arg("-i");
-    c.arg(p.as_str());
+    args(c, "-i", p);
   }
   // -i takes several files, and a prompt may start with a dash.
-  c.arg("--");
-  c.arg(#text > 0 ? text : "See the attached images.");
+  args(c, "--", #text > 0 ? text : "See the attached images.");
   return c;
 }
 
-pub fn read_codex(var t&: Transcript, line&: Json): Vector<Json> {
-  var out = new::<Json>();
+pub fn read_codex(var t&: Transcript, line&: Json): List<Json> {
+  var out = List::<Json>();
   let kind = str_of(line, "type") ?? "";
   if (kind == "thread.started") {
     t.session = from_str(str_of(line, "thread_id") ?? "");
@@ -75,37 +71,37 @@ pub fn read_codex(var t&: Transcript, line&: Json): Vector<Json> {
     let done = kind == "item.completed";
     let item_type = str_of(item, "type") ?? "";
     if (item_type == "agent_message" && done) {
-      out.push(said(id.as_str(), "agent", str_of(item, "text") ?? ""));
+      out.push(said(id, "agent", str_of(item, "text") ?? ""));
     } else if (item_type == "command_execution") {
       if (done) {
         let ok = (num_of(item, "exit_code") ?? 1.0) == 0.0;
-        out.push(tool_finished(id.as_str(), ok, str_of(item, "aggregated_output") ?? ""));
+        out.push(tool_finished(id, ok, str_of(item, "aggregated_output") ?? ""));
       } else {
-        out.push(tool_started(id.as_str(), "shell", shell_command(str_of(item, "command") ?? "")));
+        out.push(tool_started(id, "shell", shell_command(str_of(item, "command") ?? "")));
       }
     } else if (item_type == "file_change") {
       if (done) {
-        out.push(tool_finished(id.as_str(), (str_of(item, "status") ?? "") != "failed", ""));
+        out.push(tool_finished(id, (str_of(item, "status") ?? "") != "failed", ""));
       } else {
-        out.push(tool_started(id.as_str(), "edit", changed_paths(item).as_str()));
+        out.push(tool_started(id, "edit", changed_paths(item).as_str()));
       }
     } else if (item_type == "web_search") {
       if (!done) {
-        out.push(tool_started(id.as_str(), "search", str_of(item, "query") ?? ""));
+        out.push(tool_started(id, "search", str_of(item, "query") ?? ""));
       } else {
-        out.push(tool_finished(id.as_str(), true, ""));
+        out.push(tool_finished(id, true, ""));
       }
     } else if (item_type == "mcp_tool_call") {
       if (!done) {
         var name = from_str(str_of(item, "server") ?? "mcp");
         name.push_c8('.');
         name.push_str(str_of(item, "tool") ?? "");
-        out.push(tool_started(id.as_str(), name.as_str(), ""));
+        out.push(tool_started(id, name, ""));
       } else {
-        out.push(tool_finished(id.as_str(), (str_of(item, "status") ?? "") != "failed", ""));
+        out.push(tool_finished(id, (str_of(item, "status") ?? "") != "failed", ""));
       }
     } else if (item_type == "error" && done) {
-      out.push(said(id.as_str(), "error", str_of(item, "message") ?? "Codex reported an error."));
+      out.push(said(id, "error", str_of(item, "message") ?? "Codex reported an error."));
     }
   }
   return out;
@@ -133,7 +129,7 @@ fn changed_paths(item&: Json): String {
 }
 
 // The session's running token total a rollout line reports.
-fn rollout_total(line&: Json): f64? {
+pub fn rollout_total(line&: Json): f64? {
   if ((str_of(get(line, "payload") ?? Json::Null, "type") ?? "") != "token_count") {
     return none;
   }
@@ -161,7 +157,7 @@ pub fn last_total(file: str): f64 {
   };
   let text = utf8_lossy(bytes.as_slice());
   var total: f64 = 0.0;
-  for (let line in lines(text.as_str())) {
+  for (let line in lines(text)) {
     if (let j = parse(line)) {
       if (let n = rollout_total(j)) {
         total = n;
@@ -171,21 +167,21 @@ pub fn last_total(file: str): f64 {
   return total;
 }
 
-fn sorted_names(dir: str): Vector<String> {
-  var names = list_directory(dir) ?? new::<String>();
+fn sorted_names(dir: str): List<String> {
+  var names = list_directory(dir) ?? List::<String>();
   sort(names.as_slice_var());
   return names;
 }
 
 // The newest `count` rollout files by name, newest first. Their names
 // start with the time the session began.
-pub fn newest_rollouts(count: usize): Vector<String> => rollouts(count, "");
+pub fn newest_rollouts(count: usize): List<String> => rollouts(count, "");
 
 // A session's rollout, among the newest files.
 pub fn rollout_of(session: str): String? {
   var suffix = from_str(session);
   suffix.push_str(".jsonl");
-  var found = rollouts(1, suffix.as_str());
+  var found = rollouts(1, suffix);
   if (found.is_empty()) {
     return none;
   }
@@ -194,26 +190,26 @@ pub fn rollout_of(session: str): String? {
 
 // The newest `count` rollouts ending in `suffix`, looking through the
 // newest three days that have sessions.
-fn rollouts(count: usize, suffix: str): Vector<String> {
+fn rollouts(count: usize, suffix: str): List<String> {
   var root = get_environment_variable("CODEX_HOME") ?? join((get_environment_variable("HOME") ?? String()).as_str(), ".codex");
-  let sessions = join(root.as_str(), "sessions");
-  var out = new::<String>();
+  let sessions = join(root, "sessions");
+  var out = List::<String>();
   var looked: usize = 0;
-  var years = sorted_names(sessions.as_str());
+  var years = sorted_names(sessions);
   while (years.len() > 0 && out.len() < count) {
-    let y = join(sessions.as_str(), years.pop()!.as_str());
-    var months = sorted_names(y.as_str());
+    let y = join(sessions, years.pop()!.as_str());
+    var months = sorted_names(y);
     while (months.len() > 0 && out.len() < count) {
-      let m = join(y.as_str(), months.pop()!.as_str());
-      var days = sorted_names(m.as_str());
+      let m = join(y, months.pop()!.as_str());
+      var days = sorted_names(m);
       while (days.len() > 0 && out.len() < count && looked < 3) {
         looked += 1;
-        let d = join(m.as_str(), days.pop()!.as_str());
-        var files = sorted_names(d.as_str());
+        let d = join(m, days.pop()!.as_str());
+        var files = sorted_names(d);
         while (files.len() > 0 && out.len() < count) {
           let f = files.pop()!;
-          if (starts_with(f.as_str(), "rollout-") && ends_with(f.as_str(), ".jsonl") && ends_with(f.as_str(), suffix)) {
-            out.push(join(d.as_str(), f.as_str()));
+          if (starts_with(f, "rollout-") && ends_with(f, ".jsonl") && ends_with(f, suffix)) {
+            out.push(join(d, f));
           }
         }
       }

@@ -6,18 +6,17 @@
 
 module worker::watch;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Json, parse, object, set, text} from akibase::text::json;
-import {SharedPointer} from akibase::memory::shared_pointer;
-import {Mutex} from akibase::threading::mutex;
-import {Atomic} from akibase::atomic;
-import {Vector, new} from akibase::containers::vector;
-import {milliseconds, sleep} from akibase::time::time;
+import {String, from_str} from akikit::strings::string;
+import {Json, parse, object, set, text} from akikit::text::json;
+import {Arc} from akikit::memory::arc;
+import {Atomic} from akikit::threading::atomic;
+import {List} from akikit::containers::list;
+import {milliseconds, sleep} from akikit::time::time;
 import {str_of} from wire::fields;
 import {said, tool_finished, entry_message} from worker::entry;
 import {Transcript} from worker::transcript;
 import {read_terminal} from worker::claude_code;
-import {Ended, Outbox, post, state_message} from worker::turn;
+import {Ended, Outbox, SharedOutbox, post, state_message} from worker::turn;
 import {TerminalSession, alive, reread, end_session, transcript_path} from worker::terminal;
 import {Tail, open_tail} from worker::tail;
 
@@ -28,31 +27,31 @@ comptime let kStatusEvery: u32 = 4;
 pub struct WatchJob : Send {
   pub var task: String
   pub var session: TerminalSession
-  pub var outbox: SharedPointer<Mutex<Outbox>>
+  pub var outbox: SharedOutbox
   // Set by the crew when the task is stopped or a message for it waits.
-  pub var stopped: SharedPointer<Atomic<i32>>
+  pub var stopped: Arc<Atomic<i32>>
 }
 
 struct Mirror {
   pub var transcript: Transcript
   pub var title: String
   // Ids of tool calls still running.
-  pub var running: Vector<String>
+  pub var running: List<String>
 }
 
-pub fn watch_session(job: WatchJob): () {
+pub fn watch_session(job: WatchJob) {
   let task = job.task.as_str();
   var m = Mirror {
-    transcript: Transcript("w", job.session.id.as_str()), title: String(),
-    running: new::<String>()
+    transcript: Transcript("w", job.session.id), title: String(),
+    running: List::<String>()
   };
   post(job.outbox, entry_message(task, said("w.following", "note",
     "Following a Claude Code session in a terminal. Replying stops it there and continues here.")));
   post(job.outbox, state_message(task, job.session.busy ? "working" : "idle"));
   // A session that has not had its first prompt has no transcript yet.
   while (true) {
-    if (let p = transcript_path(job.session.id.as_str())) {
-      if (var tail = open_tail(p.as_str())) {
+    if (let p = transcript_path(job.session.id)) {
+      if (var tail = open_tail(p)) {
         follow(job, m, tail);
         break;
       }
@@ -61,19 +60,19 @@ pub fn watch_session(job: WatchJob): () {
       take_over(job, m);
       break;
     }
-    if (!alive(job.session.pid, job.session.proc_start.as_str())) {
+    if (!alive(job.session.pid, job.session.proc_start)) {
       post(job.outbox, state_message(task, "idle"));
       break;
     }
     sleep(milliseconds(kPollMillis));
   }
   job.outbox.get().with_arg(Ended { task: job.task.clone(), session: job.session.id.clone() },
-    fn(out: &var Outbox, e: Ended): () {
-      out.ended.push(e);
-    });
+    fn(out: &var Outbox, e: Ended) {
+    out.ended.push(e);
+  });
 }
 
-fn follow(job&: WatchJob, var m&: Mirror, var tail&: Tail): () {
+fn follow(job&: WatchJob, var m&: Mirror, var tail&: Tail) {
   let task = job.task.as_str();
   var busy = job.session.busy;
   var polls: u32 = 0;
@@ -87,7 +86,7 @@ fn follow(job&: WatchJob, var m&: Mirror, var tail&: Tail): () {
     }
     polls += 1;
     if (polls % kStatusEvery == 0) {
-      if (!alive(job.session.pid, job.session.proc_start.as_str())) {
+      if (!alive(job.session.pid, job.session.proc_start)) {
         drain(job, m, tail);
         cut_off(job, m, "The terminal session ended.");
         post(job.outbox, state_message(task, "idle"));
@@ -113,30 +112,29 @@ fn follow(job&: WatchJob, var m&: Mirror, var tail&: Tail): () {
 
 // The terminal is gone for good. A turn waiting on the task sets its state
 // again when it starts.
-fn take_over(job&: WatchJob, var m&: Mirror): () {
+fn take_over(job&: WatchJob, var m&: Mirror) {
   end_session(job.session);
   cut_off(job, m, "Stopped with the terminal.");
-  post(job.outbox, entry_message(job.task.as_str(), said("w.took-over", "note", "Took over from the terminal.")));
-  post(job.outbox, state_message(job.task.as_str(), "stopped"));
+  post(job.outbox, entry_message(job.task, said("w.took-over", "note", "Took over from the terminal.")));
+  post(job.outbox, state_message(job.task, "stopped"));
 }
 
 // Tool calls the terminal never finished.
-fn cut_off(job&: WatchJob, var m&: Mirror, why: str): () {
-  while (m.running.len() > 0) {
-    let id = m.running.remove(0);
-    post(job.outbox, entry_message(job.task.as_str(), tool_finished(id.as_str(), false, why)));
-  }
+fn cut_off(job&: WatchJob, var m&: Mirror, why: str) {
+  m.running.drain(fn(id: String) {
+    post(job.outbox, entry_message(job.task, tool_finished(id, false, why)));
+  });
 }
 
-fn drain(job&: WatchJob, var m&: Mirror, var tail&: Tail): () {
+fn drain(job&: WatchJob, var m&: Mirror, var tail&: Tail) {
   let task = job.task.as_str();
   while (let line = tail.next_line()) {
-    let j = parse(line.as_str()) else {
+    let j = parse(line) else {
       continue;
     };
     if ((str_of(j, "type") ?? "") == "ai-title") {
       if (let t = str_of(j, "aiTitle")) {
-        if (m.title.as_str() != t) {
+        if (m.title != t) {
           m.title = from_str(t);
           post(job.outbox, title_message(task, t));
         }
@@ -144,15 +142,14 @@ fn drain(job&: WatchJob, var m&: Mirror, var tail&: Tail): () {
       continue;
     }
     var list = read_terminal(m.transcript, j);
-    while (list.len() > 0) {
-      let e = list.remove(0);
+    list.drain(fn(e: Json) {
       track(m, e);
       post(job.outbox, entry_message(task, e));
-    }
+    });
   }
 }
 
-fn track(var m&: Mirror, e&: Json): () {
+fn track(var m&: Mirror, e&: Json) {
   let id = str_of(e, "id") ?? "";
   let state = str_of(e, "state") ?? "";
   if (state == "running") {

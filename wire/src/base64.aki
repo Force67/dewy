@@ -2,8 +2,8 @@ module wire::base64;
 
 // Standard base64 with padding, as agents and HTTP clients write it.
 
-import {String} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
+import {String} from akikit::strings::string;
+import {List} from akikit::containers::list;
 
 comptime let kAlphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -53,8 +53,8 @@ fn value(c: c8): i32 {
 }
 
 // None when text is not base64. Whitespace is skipped, padding optional.
-pub fn decode(text: str): Vector<u8>? {
-  var out = new::<u8>();
+pub fn decode(text: str): List<byte>? {
+  var out = List::<byte>();
   out.reserve(#text / 4 * 3);
   var acc: u32 = 0;
   var bits: u32 = 0;
@@ -70,7 +70,7 @@ pub fn decode(text: str): Vector<u8>? {
     bits += 6;
     if (bits >= 8) {
       bits -= 8;
-      out.push(((acc >> bits) & 0xff) as u8);
+      out.push(((acc >> bits) & 0xff) as byte);
     }
   }
   return out;

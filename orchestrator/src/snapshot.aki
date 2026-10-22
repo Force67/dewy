@@ -4,29 +4,27 @@
 
 module orchestrator::snapshot;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {parse, to_string, as_array} from akibase::text::json;
-import {read_file, write_file, rename_file} from akibase::filesystem::file_util;
-import {create_directories, list_directory} from akibase::filesystem::directory;
-import {join} from akibase::filesystem::path;
-import {ends_with} from akibase::strings::string_search;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {parse, to_string, as_array} from akikit::text::json;
+import {atomic_write} from wire::files;
+import {read_file} from akikit::filesystem::file_util;
+import {create_directories, list_directory} from akikit::filesystem::directory;
+import {join} from akikit::filesystem::path;
+import {ends_with} from akikit::strings::string_search;
 import {Board} from orchestrator::board;
 
 // Files ready to write, taken from the board under its lock.
 pub struct Pending : Send {
-  pub var names: Vector<String>
-  pub var texts: Vector<String>
+  pub var names: List<String> = List()
+  pub var texts: List<String> = List()
 }
 
 pub fn prepare(var board&: Board): Pending {
-  var p = Pending { names: new::<String>(), texts: new::<String>() };
+  var p = Pending {};
   for (let id& in board.take_dirty_tasks()) {
-    if (let t = board.task_json(id.as_str())) {
-      var name = from_str("tasks/");
-      name.push_str(id.as_str());
-      name.push_str(".json");
-      p.names.push(name);
+    if (let t = board.task_json(id)) {
+      p.names.push(f"tasks/{id}.json");
       p.texts.push(to_string(t));
     }
   }
@@ -41,13 +39,7 @@ pub fn write(dir: str, p&: Pending): bool {
   var ok = true;
   for (let i in 0usize..p.names.len()) {
     let path = join(dir, p.names[i].as_str());
-    var temp = path.clone();
-    temp.push_str(".tmp");
-    if (let _ = write_file(temp.as_str(), p.texts[i].as_str())) {
-      if (let _ = rename_file(temp.as_str(), path.as_str())) {
-        continue;
-      }
-    }
+    if (let _ = atomic_write(path, p.texts[i])) { continue; }
     ok = false;
   }
   return ok;
@@ -55,9 +47,9 @@ pub fn write(dir: str, p&: Pending): bool {
 
 pub fn load(dir: str, var board&: Board): usize {
   let tasks_dir = join(dir, "tasks");
-  let _ = create_directories(tasks_dir.as_str());
+  let _ = create_directories(tasks_dir);
   if (let text = read_file(join(dir, "boxes.json").as_str())) {
-    if (let j = parse(text.as_str())) {
+    if (let j = parse(text)) {
       if (let boxes = as_array(j)) {
         for (let b& in boxes) {
           board.restore_box(b);
@@ -66,13 +58,13 @@ pub fn load(dir: str, var board&: Board): usize {
     }
   }
   var count: usize = 0;
-  let names = list_directory(tasks_dir.as_str()) ?? new::<String>();
+  let names = list_directory(tasks_dir) ?? List::<String>();
   for (let name& in names) {
-    if (!ends_with(name.as_str(), ".json")) {
+    if (!ends_with(name, ".json")) {
       continue;
     }
-    if (let text = read_file(join(tasks_dir.as_str(), name.as_str()).as_str())) {
-      if (let j = parse(text.as_str())) {
+    if (let text = read_file(join(tasks_dir, name).as_str())) {
+      if (let j = parse(text)) {
         board.restore_task(j);
         count += 1;
       }

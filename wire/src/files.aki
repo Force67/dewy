@@ -1,41 +1,11 @@
+// Write through a sibling file so readers see the old or the new contents.
 module wire::files;
 
-// Whole files as bytes. akibase's read_file and write_file take text, and
-// read_file refuses what is not UTF-8.
+import {FileError} from akikit::filesystem::file;
+import {write_file, rename_file} from akikit::filesystem::file_util;
 
-import {Vector, new} from akibase::containers::vector;
-import {open, OpenMode} from akibase::filesystem::file;
-
-pub fn read_bytes(path: str): Vector<u8>? {
-  var f = open(path, OpenMode::Read) else {
-    return none;
-  };
-  var out = new::<u8>();
-  var chunk: [u8; 65536] = [0; 65536];
-  while (true) {
-    let n = f.read(chunk[..]) else {
-      return none;
-    };
-    if (n == 0) {
-      break;
-    }
-    for (let i in 0usize..n) {
-      out.push(chunk[i]);
-    }
-  }
-  return out;
-}
-
-pub fn write_bytes(path: str, data: bytes): bool {
-  var f = open(path, OpenMode::Write) else {
-    return false;
-  };
-  if (let _ = f.write(data)) {
-  } else {
-    return false;
-  }
-  if (let _ = f.close()) {
-    return true;
-  }
-  return false;
+pub fn atomic_write(path: str, body: str): () ! FileError {
+  let temporary = f"{path}.tmp";
+  try write_file(temporary, body);
+  return rename_file(temporary, path);
 }

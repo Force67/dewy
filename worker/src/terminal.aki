@@ -5,17 +5,17 @@
 
 module worker::terminal;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Json, object, array, set, push, text, number, parse} from akibase::text::json;
-import {get_environment_variable} from akibase::environment_variables;
-import {read_file, path_exists} from akibase::filesystem::file_util;
-import {list_directory} from akibase::filesystem::directory;
-import {join} from akibase::filesystem::path;
-import {split_whitespace} from akibase::strings::string_util;
-import {split_last_once, ends_with} from akibase::strings::string_search;
-import {send_signal, kSignalTerminate, kSignalKill} from akibase::process::child;
-import {milliseconds, seconds, sleep, now} from akibase::time::time;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, object, array, set, push, text, number, parse} from akikit::text::json;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {read_file, path_exists} from akikit::filesystem::file_util;
+import {list_directory} from akikit::filesystem::directory;
+import {join} from akikit::filesystem::path;
+import {split_whitespace} from akikit::strings::string_util;
+import {split_last_once, ends_with} from akikit::strings::string_search;
+import {send_signal, kSignalTerminate, kSignalKill} from akikit::process::child;
+import {milliseconds, seconds, sleep, now} from akikit::time::time;
 import {str_of, num_of, string_of} from wire::fields;
 
 pub struct TerminalSession : Send {
@@ -32,19 +32,19 @@ pub struct TerminalSession : Send {
 
 fn claude_dir(sub: str): String {
   let home = get_environment_variable("HOME") ?? String();
-  return join(join(home.as_str(), ".claude").as_str(), sub);
+  return join(join(home, ".claude").as_str(), sub);
 }
 
 // Field 22 of /proc/<pid>/stat, counted after the command name, which may
 // hold spaces.
-fn proc_start(pid: i32): String? {
+pub fn process_start(pid: i32): String? {
   var p = from_str("/proc/");
   p.push_i64(pid as i64);
   p.push_str("/stat");
-  let stat = read_file(p.as_str()) else {
+  let stat = read_file(p) else {
     return none;
   };
-  let (_, rest) = split_last_once(stat.as_str(), ')') else {
+  let (_, rest) = split_last_once(stat, ')') else {
     return none;
   };
   let fields = split_whitespace(rest);
@@ -58,17 +58,17 @@ pub fn alive(pid: i32, start: str): bool {
   if (pid <= 0 || #start == 0) {
     return false;
   }
-  let now = proc_start(pid) else {
+  let now = process_start(pid) else {
     return false;
   };
-  return now.as_str() == start;
+  return now == start;
 }
 
 fn read_session(path: str): TerminalSession? {
   let body = read_file(path) else {
     return none;
   };
-  let j = parse(body.as_str()) else {
+  let j = parse(body) else {
     return none;
   };
   if ((str_of(j, "kind") ?? "") != "interactive") {
@@ -76,7 +76,7 @@ fn read_session(path: str): TerminalSession? {
   }
   let pid = (num_of(j, "pid") ?? 0.0) as i32;
   let start = string_of(j, "procStart");
-  if (!alive(pid, start.as_str())) {
+  if (!alive(pid, start)) {
     return none;
   }
   return TerminalSession {
@@ -86,14 +86,14 @@ fn read_session(path: str): TerminalSession? {
 }
 
 // The sessions running now, oldest first.
-pub fn terminal_sessions(): Vector<TerminalSession> {
-  var out = new::<TerminalSession>();
+pub fn terminal_sessions(): List<TerminalSession> {
+  var out = List::<TerminalSession>();
   let dir = claude_dir("sessions");
-  for (let name& in list_directory(dir.as_str()) ?? new::<String>()) {
-    if (!ends_with(name.as_str(), ".json")) {
+  for (let name& in list_directory(dir) ?? List::<String>()) {
+    if (!ends_with(name, ".json")) {
       continue;
     }
-    if (let s = read_session(join(dir.as_str(), name.as_str()).as_str())) {
+    if (let s = read_session(join(dir, name).as_str())) {
       var at = out.len();
       while (at > 0 && out[at - 1].started > s.started) {
         at -= 1;
@@ -108,7 +108,7 @@ pub fn find_session(id: str): TerminalSession? {
   var list = terminal_sessions();
   while (list.len() > 0) {
     let s = list.remove(0);
-    if (s.id.as_str() == id) {
+    if (s.id == id) {
       return s;
     }
   }
@@ -121,7 +121,7 @@ pub fn reread(s&: TerminalSession): TerminalSession? {
   var name = String();
   name.push_i64(s.pid as i64);
   name.push_str(".json");
-  let current = read_session(join(claude_dir("sessions").as_str(), name.as_str()).as_str()) else {
+  let current = read_session(join(claude_dir("sessions").as_str(), name).as_str()) else {
     return none;
   };
   if (!current.proc_start.eq(s.proc_start)) {
@@ -131,14 +131,14 @@ pub fn reread(s&: TerminalSession): TerminalSession? {
 }
 
 // Asks the terminal's Claude Code to quit, and makes it after ten seconds.
-pub fn end_session(s&: TerminalSession): () {
-  if (!alive(s.pid, s.proc_start.as_str())) {
+pub fn end_session(s&: TerminalSession) {
+  if (!alive(s.pid, s.proc_start)) {
     return;
   }
   let _ = send_signal(s.pid, kSignalTerminate);
   let start = now();
   while (start.elapsed() < seconds(10)) {
-    if (!alive(s.pid, s.proc_start.as_str())) {
+    if (!alive(s.pid, s.proc_start)) {
       return;
     }
     sleep(milliseconds(100));
@@ -153,23 +153,23 @@ pub fn transcript_path(session: str): String? {
   let projects = claude_dir("projects");
   var file = from_str(session);
   file.push_str(".jsonl");
-  for (let dir& in list_directory(projects.as_str()) ?? new::<String>()) {
-    let p = join(join(projects.as_str(), dir.as_str()).as_str(), file.as_str());
-    if (path_exists(p.as_str())) {
+  for (let dir& in list_directory(projects) ?? List::<String>()) {
+    let p = join(join(projects, dir).as_str(), file);
+    if (path_exists(p)) {
       return p;
     }
   }
   return none;
 }
 
-pub fn sessions_message(list&: Vector<TerminalSession>): Json {
+pub fn sessions_message(list&: List<TerminalSession>): Json {
   var all = array();
   for (let s& in list) {
     var o = object();
-    set(o, "id", text(s.id.as_str()));
+    set(o, "id", text(s.id));
     set(o, "pid", number(s.pid as f64));
-    set(o, "project", text(s.project.as_str()));
-    set(o, "name", text(s.name.as_str()));
+    set(o, "project", text(s.project));
+    set(o, "name", text(s.name));
     set(o, "state", text(s.busy ? "working" : "idle"));
     set(o, "started", number(s.started));
     push(all, o);

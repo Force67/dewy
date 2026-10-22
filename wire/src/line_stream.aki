@@ -4,11 +4,11 @@
 
 module wire::line_stream;
 
-import {String} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {TcpStream, NetError} from akibase::net::tcp;
-import {Json, parse, to_string} from akibase::text::json;
-import {utf8_lossy} from akibase::text::code_convert;
+import {String} from akikit::strings::string;
+import {List, extend, to_list} from akikit::containers::list;
+import {TcpStream, NetError} from akikit::net::tcp;
+import {Json, parse, to_string} from akikit::text::json;
+import {utf8_lossy} from akikit::text::code_convert;
 
 // A peer may not send a line longer than this.
 comptime let kMaxLine: usize = 8 << 20;
@@ -17,26 +17,26 @@ pub enum LinkError { Closed, Broken, TooLong }
 
 pub struct LineStream : Send {
   var stream: TcpStream
-  var buf: Vector<u8>
+  var buf: List<byte> = List()
   // Where the unread bytes of buf start.
-  var head: usize
+  var head: usize = 0
 
   pub fn LineStream(stream: TcpStream): LineStream;
   pub fn read(var self&): Json? ! LinkError;
   pub fn send(var self&, j&: Json): () ! LinkError;
   pub fn send_text(var self&, line: str): () ! LinkError;
   fn take_line(var self&): String?;
-  fn compact(var self&): ();
+  fn compact(var self&);
 }
 
-fn LineStream::LineStream(stream: TcpStream): LineStream => LineStream { stream, buf: new::<u8>(), head: 0 };
+fn LineStream::LineStream(stream: TcpStream): LineStream => LineStream { stream };
 
 // The next complete line as JSON, or none when the read timed out first.
 // Lines that are not JSON are skipped.
 fn LineStream::read(var self&): Json? ! LinkError {
   while (true) {
     if (let line = self.take_line()) {
-      if (let j = parse(line.as_str())) {
+      if (let j = parse(line)) {
         return j;
       }
       continue;
@@ -45,8 +45,8 @@ fn LineStream::read(var self&): Json? ! LinkError {
       return fail LinkError::TooLong;
     }
     self.compact();
-    var chunk = [0u8; 16384];
-    let n = self.stream.read(chunk) else (let e) {
+    var chunk = [b'\0'; 16384];
+    let n = self.stream.read(chunk[..]) else (let e) {
       return match (e) {
         NetError::TimedOut => none,
         _ => fail LinkError::Broken
@@ -55,16 +55,14 @@ fn LineStream::read(var self&): Json? ! LinkError {
     if (n == 0) {
       return fail LinkError::Closed;
     }
-    for (let i in 0usize..n) {
-      self.buf.push(chunk[i]);
-    }
+    extend(self.buf, chunk[..n as usize]);
   }
   return none;
 }
 
 fn LineStream::send(var self&, j&: Json): () ! LinkError {
   let line = to_string(j);
-  return self.send_text(line.as_str());
+  return self.send_text(line);
 }
 
 // Sends a line that is already JSON text.
@@ -80,7 +78,7 @@ fn LineStream::send_text(var self&, line: str): () ! LinkError {
 
 fn LineStream::take_line(var self&): String? {
   for (let i in self.head..#self.buf) {
-    if (self.buf[i] == 10) {
+    if (self.buf[i] == b'\n') {
       let line = utf8_lossy(self.buf.as_slice()[self.head..i]);
       self.head = i + 1;
       return line;
@@ -89,14 +87,10 @@ fn LineStream::take_line(var self&): String? {
   return none;
 }
 
-fn LineStream::compact(var self&): () {
+fn LineStream::compact(var self&) {
   if (self.head == 0) {
     return;
   }
-  var rest = new::<u8>();
-  for (let i in self.head..#self.buf) {
-    rest.push(self.buf[i]);
-  }
-  self.buf = rest;
+  self.buf = to_list(self.buf.as_slice()[self.head..]);
   self.head = 0;
 }

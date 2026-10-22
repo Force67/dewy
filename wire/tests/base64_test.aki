@@ -2,12 +2,12 @@
 
 module base64_test;
 
-import {new} from akibase::containers::vector;
-import {str_as_bytes} from akibase::strings::base_string;
-import {eprintln} from akibase::logging;
+import {List} from akikit::containers::list;
+import {str_as_bytes} from akikit::strings::string;
+import {eprintln} from akikit::logging;
 import {encode, decode} from wire::base64;
 
-fn check(ok: bool, what: str, var failures&: i32): () {
+fn check(ok: bool, what: str, var failures&: i32) {
   if (!ok) {
     eprintln(what);
     failures += 1;
@@ -23,9 +23,9 @@ pub fn main(): i32 {
     let back = decode(coded[i])!;
     check(back.len() == #plain[i], "decodes the RFC 4648 vectors", failures);
   }
-  var all = new::<u8>();
+  var all = List::<byte>();
   for (let b in 0u32..256) {
-    all.push(b as u8);
+    all.push(b as byte);
   }
   let text = encode(all.as_slice());
   let round = decode(text.as_str())!;

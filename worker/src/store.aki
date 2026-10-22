@@ -1,0 +1,107 @@
+// Private, durable turn orders. A process lock prevents two workers from
+// consuming the same files or driving the same tmux sessions.
+module worker::store;
+
+import {String, from_str, with_nul} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, to_string, parse, text, boolean} from akikit::text::json;
+import {get_environment_variable} from akikit::process::environment_variables;
+import {create_directories, list_directory} from akikit::filesystem::directory;
+import {remove_tree} from akikit::filesystem::file_enumerator;
+import {read_file, delete_file, real_path, set_permissions} from akikit::filesystem::file_util;
+import {join} from akikit::filesystem::path;
+import {ends_with} from akikit::strings::string_search;
+import {sort} from akikit::algorithm;
+import {system_now} from akikit::time::time;
+import {put} from wire::fields;
+import {atomic_write} from wire::files;
+
+extern("openat") fn c_openat(base: i32, path: *const c8, flags: i32, mode: u32): i32;
+extern("flock") fn c_flock(fd: i32, op: i32): i32;
+extern("close") fn c_close(fd: i32): i32;
+
+pub struct Store {
+  pub var dir: String
+  var fd: i32
+
+  fn Store(dir: String, fd: i32): Store;
+  fn ~Store();
+}
+
+fn Store::Store(dir: String, fd: i32): Store => Store { dir, fd };
+fn Store::~Store() { unsafe { let _ = c_close(self.fd); } }
+
+// Hex is reversible and keeps paths and tmux targets free of separators.
+pub fn key(value: str): String {
+  var out = String();
+  for (let c in value) {
+    let n = c as u8;
+    let hex = "0123456789abcdef";
+    out.push_c8(hex[(n >> 4) as usize]);
+    out.push_c8(hex[(n & 15) as usize]);
+  }
+  return out;
+}
+
+pub fn default_dir(name: str): String {
+  let home = get_environment_variable("HOME") ?? from_str(".");
+  let state = get_environment_variable("XDG_STATE_HOME") ?? join(home, ".local/state");
+  return join(join(state, "dewy/workers").as_str(), key(name).as_str());
+}
+
+pub fn open_store(dir: str): Store? {
+  if (!create_directories(dir)) { return none; }
+  if (let _ = set_permissions(dir, 0o700)) {} else { return none; }
+  let canonical = real_path(dir) else { return none; };
+  let path = with_nul(join(canonical, "worker.lock").as_str());
+  var fd: i32 = -1;
+  unsafe {
+    // O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW; LOCK_EX | LOCK_NB.
+    fd = c_openat(-100, @ptr(path.as_str()), 0o2400102, 0o600);
+    if (fd < 0) { return none; }
+    if (c_flock(fd, 6) != 0) {
+      let _ = c_close(fd);
+      return none;
+    }
+  }
+  return Store(canonical, fd);
+}
+
+pub fn save_order(dir: str, msg&: Json): String? {
+  let name = f"{system_now().unix_nanoseconds()}.json";
+  let path = join(dir, name);
+  if (let _ = atomic_write(path, to_string(msg))) { return path; }
+  return none;
+}
+
+pub fn orders(dir: str): List<String> {
+  var names = list_directory(dir) ?? List::<String>();
+  sort(names.as_slice_var());
+  var out = List::<String>();
+  for (let name in names) {
+    if (ends_with(name, ".json")) { out.push(join(dir, name)); }
+  }
+  return out;
+}
+
+pub fn run_dir(record: str): String => f"{record}.run";
+
+pub fn forget(record: str) {
+  let _ = delete_file(record);
+  let _ = delete_file(stop_path(record).as_str());
+  let _ = remove_tree(run_dir(record).as_str());
+}
+
+pub fn stop_path(record: str): String => f"{record}.stop";
+
+// Resolve the session before the previous turn's record can be removed.
+// A crash between queueing a reply and spawning its thread still resumes
+// the conversation, and keeps the permission mode selected at launch.
+pub fn resolve_order(record: str, session: str, yolo: bool): bool {
+  let body = read_file(record) else { return false; };
+  var msg = parse(body) else { return false; };
+  put(msg, "session", text(session));
+  put(msg, "yolo", boolean(yolo));
+  if (let _ = atomic_write(record, to_string(msg))) { return true; }
+  return false;
+}

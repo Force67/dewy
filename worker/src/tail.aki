@@ -1,30 +1,30 @@
 // A file another process appends to, read line by line as it grows.
-// akibase's File reads through stdio, whose end of file sticks, so this
-// reads the descriptor: past the end, read(2) returns 0 until more is
-// written.
+// Reads use a descriptor and lseek for transcript positioning: past the
+// end, read(2) returns 0 until more is written.
 
 module worker::tail;
 
-import {String, with_nul} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {utf8_lossy} from akibase::text::code_convert;
+import {String, with_nul} from akikit::strings::string;
+import {List, extend, to_list} from akikit::containers::list;
+import {utf8_lossy} from akikit::text::code_convert;
 
 extern("open") fn c_open(path: *const c8, flags: i32): i32;
-extern("read") fn c_read(fd: i32, p: *var u8, n: usize): i64;
+extern("read") fn c_read(fd: i32, p: *var byte, n: usize): i64;
 extern("close") fn c_close(fd: i32): i32;
 extern("lseek") fn c_lseek(fd: i32, offset: i64, whence: i32): i64;
 
 comptime let kReadOnly: i32 = 0;
 
-pub struct Tail : Drop, Send {
+pub struct Tail : Send {
   var fd: i32
-  var buf: Vector<u8>
-  var head: usize
+  var buf: List<byte> = List()
+  var head: usize = 0
 
   fn Tail(fd: i32): Tail;
   pub fn next_line(var self&): String?;
-  pub fn skip_to_end(var self&): ();
-  pub fn drop(var self&): ();
+  pub fn skip_to_end(var self&);
+  pub fn final_line(var self&): String?;
+  fn ~Tail();
 }
 
 pub fn open_tail(path: str): Tail? {
@@ -39,14 +39,14 @@ pub fn open_tail(path: str): Tail? {
   return Tail(fd);
 }
 
-fn Tail::Tail(fd: i32): Tail => Tail { fd, buf: new::<u8>(), head: 0 };
+fn Tail::Tail(fd: i32): Tail => Tail { fd };
 
 // Skips what the file holds so far.
-fn Tail::skip_to_end(var self&): () {
+fn Tail::skip_to_end(var self&) {
   unsafe {
     let _ = c_lseek(self.fd, 0, 2);
   }
-  self.buf = new::<u8>();
+  self.buf = List::<byte>();
   self.head = 0;
 }
 
@@ -55,21 +55,17 @@ fn Tail::skip_to_end(var self&): () {
 fn Tail::next_line(var self&): String? {
   while (true) {
     for (let i in self.head..#self.buf) {
-      if (self.buf[i] == 10) {
+      if (self.buf[i] == b'\n') {
         let line = utf8_lossy(self.buf.as_slice()[self.head..i]);
         self.head = i + 1;
         return line;
       }
     }
     if (self.head > 0) {
-      var rest = new::<u8>();
-      for (let i in self.head..#self.buf) {
-        rest.push(self.buf[i]);
-      }
-      self.buf = rest;
+      self.buf = to_list(self.buf.as_slice()[self.head..]);
       self.head = 0;
     }
-    var chunk = [0u8; 65536];
+    var chunk = [b'\0'; 65536];
     var n: i64 = 0;
     unsafe {
       n = c_read(self.fd, @ptr(chunk), 65536);
@@ -77,14 +73,21 @@ fn Tail::next_line(var self&): String? {
     if (n <= 0) {
       return none;
     }
-    for (let i in 0usize..n as usize) {
-      self.buf.push(chunk[i]);
-    }
+    extend(self.buf, chunk[..n as usize]);
   }
   return none;
 }
 
-fn Tail::drop(var self&): () {
+// After the writer exits, a final line need not have a trailing newline.
+fn Tail::final_line(var self&): String? {
+  if (self.head == self.buf.len()) { return none; }
+  let line = utf8_lossy(self.buf.as_slice()[self.head..]);
+  self.buf.clear();
+  self.head = 0;
+  return line;
+}
+
+fn Tail::~Tail() {
   if (self.fd >= 0) {
     unsafe {
       let _ = c_close(self.fd);
@@ -94,7 +97,7 @@ fn Tail::drop(var self&): () {
 
 // The last `n` bytes of a file, read rather than mapped: a mapped file
 // that shrinks kills the process.
-pub fn last_bytes(path: str, n: usize): Vector<u8>? {
+pub fn last_bytes(path: str, n: usize): List<byte>? {
   let c = with_nul(path);
   var fd: i32 = -1;
   unsafe {
@@ -103,8 +106,8 @@ pub fn last_bytes(path: str, n: usize): Vector<u8>? {
   if (fd < 0) {
     return none;
   }
-  var out = new::<u8>();
-  var chunk = [0u8; 65536];
+  var out = List::<byte>();
+  var chunk = [b'\0'; 65536];
   unsafe {
     let size = c_lseek(fd, 0, 2);
     let start = size > n as i64 ? size - n as i64 : 0;
@@ -114,9 +117,7 @@ pub fn last_bytes(path: str, n: usize): Vector<u8>? {
         if (got <= 0) {
           break;
         }
-        for (let i in 0usize..got as usize) {
-          out.push(chunk[i]);
-        }
+        extend(out, chunk[..got as usize]);
       }
     }
     let _ = c_close(fd);

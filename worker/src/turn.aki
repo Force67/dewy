@@ -1,35 +1,45 @@
-// One turn of one agent on its own thread: start the agent in the
-// project, read its output through a named pipe as it comes, and post the
-// entries it translates to into the outbox the main loop sends from.
+// One turn of one agent: tmux owns the supervisor and the agent; this
+// thread follows its durable JSON output and can recover it after restart.
 
 module worker::turn;
 
-import {String, from_str, with_nul} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {spawn_error_message, exit_code} from akibase::process::child;
-import {Json, parse, object, array, push, set, text, number, to_string} from akibase::text::json;
-import {SharedPointer} from akibase::memory::shared_pointer;
-import {Mutex} from akibase::threading::mutex;
-import {Atomic} from akibase::atomic;
-import {read_file, write_file, delete_file} from akibase::filesystem::file_util;
+import {String, from_str, with_nul} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, parse, object, array, push, set, text, number, to_string} from akikit::text::json;
+import {Arc} from akikit::memory::arc;
+import {Mutex} from akikit::threading::mutex;
+import {Atomic} from akikit::threading::atomic;
+import {read_file, write_file, path_exists} from akikit::filesystem::file_util;
 import {decode} from wire::base64;
-import {write_bytes} from wire::files;
-import {temp_directory} from akibase::filesystem::common_directory_providers;
-import {join} from akibase::filesystem::path;
-import {system_now} from akibase::time::time;
-import {trim, find} from akibase::strings::string_search;
+import {write_bytes} from akikit::filesystem::file_util;
+import {temp_directory} from akikit::filesystem::common_directory_providers;
+import {join} from akikit::filesystem::path;
+import {milliseconds, seconds, sleep, now} from akikit::time::time;
+import {create_directories} from akikit::filesystem::directory;
+import {parse_f64} from akikit::strings::string_to_number;
+import {trim, find} from akikit::strings::string_search;
 import {clip} from wire::clip;
 import {said, entry_message} from worker::entry;
 import {usage_message} from worker::usage;
 import {Transcript} from worker::transcript;
-import {make_fifo} from worker::fifo;
+import {run_dir, stop_path} from worker::store;
+import {atomic_write} from wire::files;
+import {socket_path, session_name, launch, exists, result, close_session, abandon} from worker::tmux;
 import {claude_command, claude_input, read_claude} from worker::claude_code;
-import {codex_command, read_codex, read_rollout, rollout_of, last_total} from worker::codex;
+import {codex_command, read_codex, read_rollout, rollout_of, last_total, rollout_total} from worker::codex;
 import {Tail, open_tail} from worker::tail;
 import {opencode_command, read_opencode} from worker::opencode;
 import {find_session, end_session} from worker::terminal;
 
-pub enum Agent { Claude, Codex, OpenCode }
+pub enum Agent {
+  Claude, Codex, OpenCode
+
+  pub fn name(self): str<'static> => match (self) {
+    Agent::Claude => "claude",
+    Agent::Codex => "codex",
+    Agent::OpenCode => "opencode",
+  };
+}
 
 pub fn agent_named(name: str): Agent? => match (name) {
   "claude" => Agent::Claude,
@@ -38,26 +48,23 @@ pub fn agent_named(name: str): Agent? => match (name) {
   _ => none,
 };
 
-pub fn agent_name(a: Agent): str<'static> => match (a) {
-  Agent::Claude => "claude",
-  Agent::Codex => "codex",
-  Agent::OpenCode => "opencode",
-};
-
 // A turn that ended, so the crew can start the next one for its task.
 pub struct Ended : Send {
   pub var task: String
   pub var session: String
+  pub var record: String = String()
 }
 
 pub struct Outbox : Send {
   // JSON lines for the orchestrator.
-  pub var lines: Vector<String>
-  pub var ended: Vector<Ended>
+  pub var lines: List<String> = List()
+  pub var ended: List<Ended> = List()
   // The newest measured usage line not yet sent; a newer one replaces it,
   // so a worker cut off for days does not pile them up.
-  pub var measured: String
+  pub var measured: String = String()
 }
+
+pub type SharedOutbox = Arc<Mutex<Outbox>>;
 
 // An image for the turn's prompt, its data in base64.
 pub struct TurnImage : Send {
@@ -67,6 +74,7 @@ pub struct TurnImage : Send {
 }
 
 pub struct TurnOrder : Send {
+  pub var record: String
   pub var task: String
   pub var turn: String
   pub var agent: Agent
@@ -75,7 +83,7 @@ pub struct TurnOrder : Send {
   pub var text: String
   // The task asked to run without permission prompts.
   pub var yolo: bool
-  pub var images: Vector<TurnImage>
+  pub var images: List<TurnImage>
   // provider/model for opencode, empty for the agent's default.
   pub var model: String
 }
@@ -83,14 +91,14 @@ pub struct TurnOrder : Send {
 pub struct TurnJob : Send {
   pub var order: TurnOrder
   pub var yolo: bool
-  pub var outbox: SharedPointer<Mutex<Outbox>>
-  pub var pid: SharedPointer<Atomic<i32>>
+  pub var outbox: SharedOutbox
+  pub var data_dir: String
   // Set by the crew when the user stopped the task.
-  pub var stopped: SharedPointer<Atomic<i32>>
+  pub var stopped: Arc<Atomic<i32>>
 }
 
-pub fn post(outbox&: SharedPointer<Mutex<Outbox>>, j&: Json): () {
-  outbox.get().with_arg(to_string(j), fn(o: &var Outbox, line: String): () {
+pub fn post(outbox&: SharedOutbox, j&: Json) {
+  outbox.get().with_arg(to_string(j), fn(o: &var Outbox, line: String) {
     o.lines.push(line);
   });
 }
@@ -111,49 +119,53 @@ fn session_message(task: str, session: str): Json {
   return m;
 }
 
-pub fn run_turn(job: TurnJob): () {
+pub fn run_turn(job: TurnJob) {
   let o& = job.order;
   let task = o.task.as_str();
-  var stem = from_str("dewy-");
-  stem.push_str(task);
-  stem.push_c8('-');
-  stem.push_i64(system_now().unix_nanoseconds());
-  let out_path = join(private_temp().as_str(), stem.as_str());
-  var err_path = out_path.clone();
-  err_path.push_str(".err");
-
-  var t = Transcript(o.turn.as_str(), o.session.as_str());
-  post(job.outbox, state_message(task, "working"));
-  var inputs = new::<String>();
-  let prepared = image_files(o, out_path.as_str(), inputs);
-  // Two writers on one session diverge, so a terminal still running it
-  // ends first.
-  if (o.agent == Agent::Claude && !o.session.is_empty()) {
-    if (let s = find_session(o.session.as_str())) {
-      end_session(s);
-      post(job.outbox, entry_message(task, said(t.next_id().as_str(), "note", "Took over from the terminal.")));
-    }
-  }
+  let dir = run_dir(o.record);
+  let out_path = join(dir, "output.jsonl");
+  let err_path = join(dir, "stderr");
+  let replay = path_exists(join(dir, "launch.json").as_str());
+  let session = replay ? (read_file(join(dir, "session").as_str()) ?? o.session.clone()) : o.session.clone();
+  var t = Transcript(o.turn, session);
+  if (path_exists(stop_path(o.record).as_str())) { job.stopped.get().store(1); }
+  if (job.stopped.get().load() == 0) { post(job.outbox, state_message(task, "working")); }
   var ok = false;
-  if (let images = prepared) {
-    ok = run_agent(job, out_path.as_str(), err_path.as_str(), images.as_slice(), t);
+  if (create_directories(dir)) {
+    var baseline: f64 = 0.0;
+    if (!replay) {
+      if (o.agent == Agent::Codex && !o.session.is_empty()) {
+        if (let path = rollout_of(o.session)) { baseline = last_total(path); }
+      }
+      let _ = atomic_write(join(dir, "session").as_str(), o.session);
+      let _ = atomic_write(join(dir, "baseline").as_str(), f"{baseline}".as_str());
+    }
+    t.codex_total = parse_f64((read_file(join(dir, "baseline").as_str()) ?? from_str("0")).as_str()) ?? 0.0;
+    // A replay uses the exact input and argv saved before the first launch.
+    if (replay) {
+      ok = run_agent(job, dir, out_path, err_path, [], t);
+    } else if (job.stopped.get().load() == 0) {
+      if (let images = image_files(o, join(dir, "input").as_str())) {
+        // The existing terminal integration still hands over before tmux
+        // starts a headless turn; two agents never write one session.
+        if (o.agent == Agent::Claude && !o.session.is_empty()) {
+          if (let session = find_session(o.session)) {
+            end_session(session);
+            post(job.outbox, entry_message(task, said(t.id_for("takeover").as_str(), "note", "Took over from the terminal.")));
+          }
+        }
+        ok = run_agent(job, dir, out_path, err_path, images.as_slice(), t);
+      } else {
+        post(job.outbox, entry_message(task, said(t.id_for("images").as_str(), "error", "The worker could not prepare the images for this message.")));
+      }
+    }
   } else {
-    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", "The worker could not prepare the images for this message.")));
+    post(job.outbox, entry_message(task, said(t.id_for("storage").as_str(), "error", "The worker could not create the turn directory.")));
   }
-  for (let p& in inputs) {
-    let _ = delete_file(p.as_str());
-  }
-  if (t.failed) {
-    ok = false;
-  }
-  let _ = delete_file(err_path.as_str());
-  if (job.stopped.get().load() == 0) {
-    post(job.outbox, state_message(task, ok ? "idle" : "failed"));
-  }
-  job.outbox.get().with_arg(Ended { task: o.task.clone(), session: t.session.clone() },
-    fn(out: &var Outbox, e: Ended): () {
-      out.ended.push(e);
-    });
+  if (t.failed) { ok = false; }
+  post(job.outbox, state_message(task, job.stopped.get().load() != 0 ? "stopped" : (ok ? "idle" : "failed")));
+  job.outbox.get().with_arg(Ended { task: o.task.clone(), session: t.session.clone(), record: o.record.clone() },
+    fn(out: &var Outbox, e: Ended) { out.ended.push(e); });
 }
 
 fn extension(media: str): str<'static> => match (media) {
@@ -165,22 +177,21 @@ fn extension(media: str): str<'static> => match (media) {
 
 // Writes the turn's images where its agent takes them: Claude reads a
 // stream-json message on standard input, which becomes the first of the
-// returned paths; Codex and opencode get files. Every file written lands in `inputs`.
+// returned paths; Codex and opencode get files. Files live in the turn directory until its final messages are sent.
 // None when an image could not be written, rather than a turn without it.
-fn image_files(o&: TurnOrder, stem: str, var inputs&: Vector<String>): Vector<String>? {
-  var paths = new::<String>();
+fn image_files(o&: TurnOrder, stem: str): List<String>? {
+  var paths = List::<String>();
   if (o.images.is_empty()) {
     return paths;
   }
   if (o.agent == Agent::Claude) {
-    var pairs = new::<(str, str)>();
+    var pairs = List::<(str, str)>();
     for (let img& in o.images) {
-      pairs.push((img.media.as_str(), img.data.as_str()));
+      pairs.push((img.media, img.data));
     }
     var p = from_str(stem);
     p.push_str(".in");
-    if (let _ = write_file(p.as_str(), claude_input(o.text.as_str(), pairs.as_slice()).as_str())) {
-      inputs.push(p.clone());
+    if (let _ = write_file(p, claude_input(o.text, pairs.as_slice()).as_str())) {
       paths.push(p);
       return paths;
     }
@@ -188,18 +199,15 @@ fn image_files(o&: TurnOrder, stem: str, var inputs&: Vector<String>): Vector<St
   }
   var n: u64 = 0;
   for (let img& in o.images) {
-    let data = decode(img.data.as_str()) else {
+    let data = decode(img.data) else {
       return none;
     };
     var p = from_str(stem);
     p.push_str(".img");
     p.push_u64(n);
-    p.push_str(extension(img.media.as_str()));
+    p.push_str(extension(img.media));
     n += 1;
-    if (!write_bytes(p.as_str(), data.as_slice())) {
-      return none;
-    }
-    inputs.push(p.clone());
+    if (let _ = write_bytes(p, data.as_slice())) {} else { return none; }
     paths.push(p);
   }
   return paths;
@@ -218,8 +226,8 @@ pub fn private_temp(): String {
     uid = c_getuid();
   }
   name.push_u64(uid as u64);
-  let dir = join(temp_directory().as_str(), name.as_str());
-  let c = with_nul(dir.as_str());
+  let dir = join(temp_directory().as_str(), name);
+  let c = with_nul(dir);
   unsafe {
     let _ = c_mkdir(@ptr(c.as_str()), 0o700);
     let _ = c_chmod(@ptr(c.as_str()), 0o700);
@@ -229,101 +237,109 @@ pub fn private_temp(): String {
 
 // Runs the agent to the end; false when it could not start or exited
 // with an error.
-fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var t&: Transcript): bool {
+fn run_agent(job&: TurnJob, dir: str, out_path: str, err_path: str, images&: [String], var t&: Transcript): bool {
   let o& = job.order;
   let task = o.task.as_str();
-  var fifo = make_fifo(out_path) else {
-    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", "The worker could not create a pipe.")));
+  let socket = socket_path(job.data_dir);
+  let name = session_name(task, o.turn);
+  if (!path_exists(join(dir, "launch.json").as_str())) {
+    let on_stdin = o.agent == Agent::Claude && #images > 0;
+    let cmd = match (o.agent) {
+      Agent::Claude => claude_command(o.text, o.session, job.yolo, on_stdin),
+      Agent::Codex => codex_command(o.text, o.session, job.yolo, images),
+      Agent::OpenCode => opencode_command(o.text, o.session, o.model, job.yolo, images),
+    };
+    let _ = write_file(out_path, "");
+    if (job.stopped.get().load() != 0) { return false; }
+    if (!launch(socket, name, dir, o.project, on_stdin ? images[0].as_str() : "/dev/null",
+                stop_path(o.record).as_str(), cmd)) {
+      post(job.outbox, entry_message(task, said(t.id_for("launch").as_str(), "error", "Could not start the agent in tmux.")));
+      return false;
+    }
+  }
+  var tail = open_tail(out_path) else {
+    post(job.outbox, entry_message(task, said(t.id_for("output").as_str(), "error", "Could not read the agent's output file.")));
     return false;
   };
-  let on_stdin = o.agent == Agent::Claude && #images > 0;
-  var cmd = match (o.agent) {
-    Agent::Claude => claude_command(o.text.as_str(), o.session.as_str(), job.yolo, on_stdin),
-    Agent::Codex => codex_command(o.text.as_str(), o.session.as_str(), job.yolo, images),
-    Agent::OpenCode => opencode_command(o.text.as_str(), o.session.as_str(), o.model.as_str(), job.yolo, images),
-  };
-  cmd.current_dir(o.project.as_str());
-  cmd.stdin_from(on_stdin ? images[0].as_str() : "/dev/null");
-  cmd.stdout_to(out_path);
-  cmd.stderr_to(err_path);
-  cmd.new_process_group();
-  var child = cmd.spawn() else (let e) {
-    var why = from_str("Could not start ");
-    why.push_str(agent_name(o.agent));
-    why.push_str(": ");
-    why.push_str(spawn_error_message(e));
-    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", why.as_str())));
-    return false;
-  };
-  job.pid.get().store(child.id());
   var session = o.session.clone();
   let provider = provider_of(o);
   var rollout: Tail? = none;
   var lookups: u32 = 0;
-  fifo.block();
-  while (let line = fifo.read_line()) {
-    let j = parse(line.as_str()) else {
+  var finished = false;
+  var probe = now();
+  while (true) {
+    if (job.stopped.get().load() != 0) {
+      let _ = atomic_write(stop_path(o.record).as_str(), "stopped");
+    }
+    var next = tail.next_line();
+    if (next == none && finished) { next = tail.final_line(); }
+    let line = next else {
+      follow(rollout, t, job, provider);
+      if (finished) { break; }
+      if (result(dir) != none) { finished = true; continue; }
+      if (probe.elapsed() > seconds(1)) {
+        probe = now();
+        if (!exists(socket, name) && result(dir) == none) {
+          abandon(dir);
+          finished = true;
+          continue;
+        }
+      }
+      sleep(milliseconds(100));
       continue;
     };
-    let entries = match (o.agent) {
+    let j = parse(line) else {
+      continue;
+    };
+    var entries = match (o.agent) {
       Agent::Claude => read_claude(t, j),
       Agent::Codex => read_codex(t, j),
       Agent::OpenCode => read_opencode(t, j),
     };
     if (!t.usage.is_empty()) {
       var meters = array();
-      push(meters, parse(t.usage.as_str())!);
+      push(meters, parse(t.usage)!);
       post(job.outbox, usage_message(meters));
       t.usage = String();
     }
     if (!t.session.eq(session)) {
       session = t.session.clone();
-      post(job.outbox, session_message(task, session.as_str()));
+      post(job.outbox, session_message(task, session));
     }
-    var list = entries;
-    while (list.len() > 0) {
-      post(job.outbox, entry_message(task, list.remove(0)));
-    }
+    entries.drain(fn(e: Json) { post(job.outbox, entry_message(task, e)); });
     if (o.agent == Agent::Codex) {
       // The rollout exists once Codex names the session; an old session
       // outside the newest days is not worth a search per line.
       if (rollout == none && !session.is_empty() && lookups < 5) {
         lookups += 1;
-        if (let path = rollout_of(session.as_str())) {
-          if (let opened = open_tail(path.as_str())) {
-            var r = opened;
-            // A resumed session's earlier turns are counted already: start
-            // from its total so far. A new one is read from its start.
-            if (!o.session.is_empty()) {
-              t.codex_total = last_total(path.as_str());
-              r.skip_to_end();
-            }
+        if (let path = rollout_of(session)) {
+          if (let opened = open_tail(path)) {
+            let r = opened;
             rollout = r;
             t.rollout = true;
           }
         }
       }
-      follow(rollout, t, job, provider.as_str());
+      follow(rollout, t, job, provider);
     }
-    post_spend(job, t, provider.as_str());
+    post_spend(job, t, provider);
   }
-  follow(rollout, t, job, provider.as_str());
-  post_spend(job, t, provider.as_str());
-  let status = child.wait();
-  job.pid.get().store(0);
-  if (exit_code(status) == 0) {
+  follow(rollout, t, job, provider);
+  post_spend(job, t, provider);
+  close_session(socket, name);
+  if ((result(dir) ?? 125) == 0) {
     return true;
   }
   if (!t.failed && job.stopped.get().load() == 0) {
     let err = read_file(err_path) ?? String();
-    var why = from_str(agent_name(o.agent));
+    var why = from_str(o.agent.name());
     why.push_str(" exited with an error.");
-    let tail = trim(err.as_str());
+    let tail = trim(err);
     if (#tail > 0) {
       why.push_str("\n\n");
       why.push_str(clip(tail, 1500));
     }
-    post(job.outbox, entry_message(task, said(t.next_id().as_str(), "error", why.as_str())));
+    post(job.outbox, entry_message(task, said(t.id_for("exit").as_str(), "error", why)));
   }
   return false;
 }
@@ -333,15 +349,20 @@ fn run_agent(job&: TurnJob, out_path: str, err_path: str, images&: [String], var
 fn provider_of(o&: TurnOrder): String => match (o.agent) {
   Agent::Claude => from_str("anthropic"),
   Agent::Codex => from_str("openai"),
-  Agent::OpenCode => from_str(o.model.as_str()[..(find(o.model.as_str(), "/") ?? 0)]),
+  Agent::OpenCode => from_str(o.model.as_str()[..(find(o.model, "/") ?? 0)]),
 };
 
 // Reads what Codex's rollout gained: its calls' tokens, then the limits
 // after them, so the orchestrator has the tokens when the limits rise.
-fn follow(var rollout&: Tail?, var t&: Transcript, job&: TurnJob, provider: str): () {
+fn follow(var rollout&: Tail?, var t&: Transcript, job&: TurnJob, provider: str) {
   if (var r& = rollout) {
     while (let line = r.next_line()) {
-      if (let j = parse(line.as_str())) {
+      if (let j = parse(line)) {
+        if (let end = read_file(join(run_dir(job.order.record).as_str(), "rollout-end").as_str())) {
+          if (let limit = parse_f64(end)) {
+            if ((rollout_total(j) ?? 0.0) > limit) { continue; }
+          }
+        }
         if (let m = read_rollout(t, j)) {
           post_spend(job, t, provider);
           var meters = array();
@@ -353,16 +374,17 @@ fn follow(var rollout&: Tail?, var t&: Transcript, job&: TurnJob, provider: str)
   }
 }
 
-fn post_spend(job&: TurnJob, var t&: Transcript, provider: str): () {
+fn post_spend(job&: TurnJob, var t&: Transcript, provider: str) {
   if (t.tokens <= 0.0 && t.cost <= 0.0) {
     return;
   }
   var m = object();
   set(m, "type", text("spend"));
-  set(m, "task", text(job.order.task.as_str()));
+  set(m, "task", text(job.order.task));
   set(m, "provider", text(provider));
-  set(m, "tokens", number(t.tokens));
-  set(m, "cost", number(t.cost));
+  set(m, "turn", text(job.order.turn));
+  set(m, "tokens", number(t.turn_tokens));
+  set(m, "cost", number(t.turn_cost));
   post(job.outbox, m);
   t.tokens = 0.0;
   t.cost = 0.0;

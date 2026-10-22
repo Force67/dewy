@@ -9,45 +9,36 @@
 
 module worker::usage;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Json, object, array, set, push, text, number, get, as_array, path} from akibase::text::json;
-import {replace_all} from akibase::strings::string_util;
-import {parse_i64} from akibase::strings::string_to_number;
-import {str_of, num_of, bool_of, copy} from wire::fields;
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, object, set, text, number, get, as_array, path} from akikit::text::json;
+import {replace_all} from akikit::strings::string_util;
+import {parse_i64} from akikit::strings::string_to_number;
+import {str_of, num_of, bool_of} from wire::fields;
 
 pub struct Meter {
   pub var agent: String
   pub var provider: String
   pub var plan: String
   pub var at: i64
-  pub var limits: Vector<Json>
-  pub var spend: Vector<Json>
+  pub var limits: List<Json> = List()
+  pub var spend: List<Json> = List()
 
   pub fn to_json(self&): Json;
 }
 
 pub fn meter(agent: str, provider: str, plan: str, at: i64): Meter => Meter {
-  agent: from_str(agent), provider: from_str(provider), plan: from_str(plan), at, limits: new::<Json>(),
-  spend: new::<Json>()
+  agent: from_str(agent), provider: from_str(provider), plan: from_str(plan), at
 };
 
 fn Meter::to_json(self&): Json {
   var m = object();
-  set(m, "agent", text(self.agent.as_str()));
-  set(m, "provider", text(self.provider.as_str()));
-  set(m, "plan", text(self.plan.as_str()));
+  set(m, "agent", text(self.agent));
+  set(m, "provider", text(self.provider));
+  set(m, "plan", text(self.plan));
   set(m, "at", number(self.at as f64));
-  var limits = array();
-  for (let l& in self.limits) {
-    push(limits, copy(l));
-  }
-  set(m, "limits", limits);
-  var spend = array();
-  for (let x& in self.spend) {
-    push(spend, copy(x));
-  }
-  set(m, "spend", spend);
+  set(m, "limits", Json::Arr(self.limits.clone()));
+  set(m, "spend", Json::Arr(self.spend.clone()));
   return m;
 }
 
@@ -108,7 +99,7 @@ pub fn claude_meter(event&: Json, at: i64): Meter? {
       for (let w& in members) {
         let used = num_of(w.value, "utilization") ?? 0.0;
         let resets = (num_of(w.value, "resetsAt") ?? 0.0) as i64 * 1000;
-        m.limits.push(limit(window_name(w.key.as_str()).as_str(), used, resets));
+        m.limits.push(limit(window_name(w.key).as_str(), used, resets));
       }
     }
     _ => {
@@ -164,8 +155,8 @@ pub comptime let kSpendWindows: [(str, str, i64); 3] = [
 
 // The rows of the spend query: one per provider, with c<window> and
 // t<window> columns.
-pub fn opencode_meters(rows&: Json, at: i64): Vector<Meter> {
-  var out = new::<Meter>();
+pub fn opencode_meters(rows&: Json, at: i64): List<Meter> {
+  var out = List::<Meter>();
   let list = as_array(rows) else {
     return out;
   };
@@ -200,7 +191,7 @@ fn unit_name(unit: i64, n: i64): String {
 }
 
 // Z.ai's quota answer: token and tool call limits per window.
-pub fn add_zai(var m&: Meter, answer&: Json): () {
+pub fn add_zai(var m&: Meter, answer&: Json) {
   let data = get(answer, "data") else {
     return;
   };
@@ -213,12 +204,12 @@ pub fn add_zai(var m&: Meter, answer&: Json): () {
     var name = from_str(kind == "TIME_LIMIT" ? "tool calls, " : "tokens, ");
     name.push_str(unit_name((num_of(l, "unit") ?? 0.0) as i64, (num_of(l, "number") ?? 0.0) as i64).as_str());
     let used = (num_of(l, "percentage") ?? 0.0) / 100.0;
-    m.limits.push(limit(name.as_str(), used, (num_of(l, "nextResetTime") ?? 0.0) as i64));
+    m.limits.push(limit(name, used, (num_of(l, "nextResetTime") ?? 0.0) as i64));
   }
 }
 
 // GitHub Copilot's user answer: the premium requests left this month.
-pub fn add_copilot(var m&: Meter, answer&: Json): () {
+pub fn add_copilot(var m&: Meter, answer&: Json) {
   m.plan = from_str(str_of(answer, "copilot_plan") ?? "");
   let premium = path(answer, "quota_snapshots.premium_interactions") else {
     return;

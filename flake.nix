@@ -22,7 +22,7 @@
       devShells.${system}.default = pkgs.mkShell {
         # akiko links through cc; it comes from a source build of
         # github.com/aki-language/akiv4 (see README.md).
-        packages = [ pkgs.gcc pkgs.jdk21 pkgs.gradle android.androidsdk ];
+        packages = [ pkgs.gcc pkgs.tmux pkgs.zlib pkgs.jdk21 pkgs.gradle android.androidsdk ];
         ANDROID_HOME = sdk;
         JAVA_HOME = pkgs.jdk21.home;
         # AGP fetches a generic aapt2 that NixOS cannot run; use the SDK's.

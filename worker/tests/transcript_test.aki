@@ -4,11 +4,11 @@
 
 module transcript_test;
 
-import {String} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Json, parse, to_string} from akibase::text::json;
-import {lines} from akibase::strings::string_util;
-import {eprintln} from akibase::logging;
+import {String} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Json, parse, to_string} from akikit::text::json;
+import {lines} from akikit::strings::string_util;
+import {eprintln} from akikit::logging;
 import {Transcript} from worker::transcript;
 import {read_claude, read_terminal, claude_input} from worker::claude_code;
 import {read_codex, read_rollout} from worker::codex;
@@ -95,8 +95,8 @@ fn check(ok: bool, what: str, var failures&: i32): () {
 }
 
 // Every entry the lines give, as JSON text without the timestamps.
-fn run(text: str, agent: str, var t&: Transcript): Vector<String> {
-  var out = new::<String>();
+fn run(text: str, agent: str, var t&: Transcript): List<String> {
+  var out = List::<String>();
   for (let line in lines(text)) {
     let j = parse(line) else {
       continue;
@@ -224,7 +224,7 @@ pub fn main(): i32 {
         "the pasted image comes first", failures);
   check(pe.len() == 2 && pe[1].as_str() == "{\"id\":\"w.u7.1\",\"kind\":\"user\",\"text\":\"what is this?\"}", "then the prompt", failures);
 
-  var pairs = new::<(str, str)>();
+  var pairs = List::<(str, str)>();
   pairs.push(("image/png", "iVBORw0KGgo="));
   let input = claude_input("what color?", pairs.as_slice());
   check(input.as_str() == "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}},{\"type\":\"text\",\"text\":\"what color?\"}]}}\n",

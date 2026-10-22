@@ -4,21 +4,21 @@
 
 module orchestrator::gzip;
 
-import {Vector, new, resize} from akibase::containers::vector;
-import {crc32} from akibase::hashing::crc;
+import {List, resize} from akikit::containers::list;
+import {crc32} from akikit::hashing::crc;
 
 extern("compressBound") fn c_compress_bound(n: u64): u64;
-extern("compress2") fn c_compress2(dest: *var u8, dest_len: *var u64, src: *const u8, src_len: u64, level: i32): i32;
+extern("compress2") fn c_compress2(dest: *var byte, dest_len: *var u64, src: *const byte, src_len: u64, level: i32): i32;
 
 comptime let kLevel: i32 = 6;
 
-pub fn gzip(data: bytes): Vector<u8>? {
-  var z = new::<u8>();
+pub fn gzip(data: bytes): List<byte>? {
+  var z = List::<byte>();
   var n: u64 = 0;
   unsafe {
     n = c_compress_bound(#data as u64);
   }
-  resize(z, n as usize, 0u8);
+  resize(z, n as usize, (0 as byte));
   var ok = false;
   unsafe {
     ok = c_compress2(@ptr(z.as_slice_var()), &raw var n, @ptr(data), #data as u64, kLevel) == 0;
@@ -26,9 +26,9 @@ pub fn gzip(data: bytes): Vector<u8>? {
   if (!ok || n < 6) {
     return none;
   }
-  var out = new::<u8>();
+  var out = List::<byte>();
   out.reserve(n as usize + 12);
-  for (let b in [0x1fu8, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]) {
+  for (let b in [(0x1f as byte), 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]) {
     out.push(b);
   }
   for (let i in 2usize..(n as usize - 4)) {
@@ -39,8 +39,8 @@ pub fn gzip(data: bytes): Vector<u8>? {
   return out;
 }
 
-fn push_le(var out&: Vector<u8>, v: u32): () {
+fn push_le(var out&: List<byte>, v: u32) {
   for (let shift in [0u32, 8, 16, 24]) {
-    out.push(((v >> shift) & 0xff) as u8);
+    out.push(((v >> shift) & 0xff) as byte);
   }
 }

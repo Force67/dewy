@@ -4,77 +4,55 @@
 
 module worker::opencode;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Vector, new} from akibase::containers::vector;
-import {Command, exit_code} from akibase::process::child;
-import {Json, array, push, text, get, path} from akibase::text::json;
-import {read_file, delete_file} from akibase::filesystem::file_util;
-import {lines} from akibase::strings::string_util;
-import {trim} from akibase::strings::string_search;
-import {seconds} from akibase::time::time;
+import {Invocation, args} from worker::invocation;
+
+import {String, from_str} from akikit::strings::string;
+import {List} from akikit::containers::list;
+import {Command} from akikit::process::child;
+import {Json, array, push, text, get, path} from akikit::text::json;
+import {lines} from akikit::strings::string_util;
+import {trim} from akikit::strings::string_search;
+import {seconds} from akikit::time::time;
+import {output_of} from worker::command;
 import {str_of, num_of} from wire::fields;
 import {said, tool_started, tool_finished} from worker::entry;
 import {Transcript} from worker::transcript;
 
-pub fn opencode_command(text: str, session: str, model: str, yolo: bool, images&: [String]): Command {
-  var c = Command("opencode");
-  c.arg("run");
-  c.arg("--format");
-  c.arg("json");
+pub fn opencode_command(text: str, session: str, model: str, yolo: bool, images&: [String]): Invocation {
+  var c = Invocation("opencode");
+  args(c, "run", "--format", "json");
   if (#session > 0) {
-    c.arg("-s");
-    c.arg(session);
+    args(c, "-s", session);
   }
   if (#model > 0) {
-    c.arg("-m");
-    c.arg(model);
+    args(c, "-m", model);
   }
   if (yolo) {
     c.arg("--auto");
   }
   for (let p& in images) {
-    c.arg("-f");
-    c.arg(p.as_str());
+    args(c, "-f", p);
   }
   // -f takes several files, and a prompt may start with a dash.
-  c.arg("--");
-  c.arg(#text > 0 ? text : "See the attached images.");
+  args(c, "--", #text > 0 ? text : "See the attached images.");
   return c;
 }
 
 // The models `opencode models` lists, empty when it fails or hangs.
-pub fn opencode_models(out_path: str): Json {
-  var list = array();
-  var c = Command("opencode");
-  c.arg("models");
-  c.stdin_from("/dev/null");
-  c.stdout_to(out_path);
-  c.stderr_to("/dev/null");
-  var child = c.spawn() else (let e) {
-    return list;
-  };
-  if (let status = child.wait_timeout(seconds(20))) {
-    if (exit_code(status) != 0) {
-      let _ = delete_file(out_path);
-      return list;
-    }
-    let listed = read_file(out_path) ?? String();
-    for (let line in lines(listed.as_str())) {
-      let model = trim(line);
-      if (#model > 0) {
-        push(list, text(model));
-      }
-    }
-  } else {
-    let _ = child.kill();
-    let _ = child.wait();
+pub fn opencode_models(): Json {
+  var models = array();
+  var command = Command("opencode");
+  command.arg("models");
+  let output = output_of(command, seconds(20)) else { return models; };
+  for (let line in lines(output)) {
+    let model = trim(line);
+    if (#model > 0) { push(models, text(model)); }
   }
-  let _ = delete_file(out_path);
-  return list;
+  return models;
 }
 
-pub fn read_opencode(var t&: Transcript, line&: Json): Vector<Json> {
-  var out = new::<Json>();
+pub fn read_opencode(var t&: Transcript, line&: Json): List<Json> {
+  var out = List::<Json>();
   if (let s = str_of(line, "sessionID")) {
     t.session = from_str(s);
   }
@@ -92,18 +70,18 @@ pub fn read_opencode(var t&: Transcript, line&: Json): Vector<Json> {
       return out;
     };
     let id = t.id_for(str_of(part, "id") ?? "");
-    out.push(tool_started(id.as_str(), str_of(part, "tool") ?? "tool", tool_detail(part)));
+    out.push(tool_started(id, str_of(part, "tool") ?? "tool", tool_detail(part)));
     let state = get(part, "state") else {
       return out;
     };
     if ((str_of(state, "status") ?? "") == "error") {
-      out.push(tool_finished(id.as_str(), false, str_of(state, "error") ?? ""));
+      out.push(tool_finished(id, false, str_of(state, "error") ?? ""));
     } else {
       var ok = true;
       if (let m = get(state, "metadata")) {
         ok = (num_of(m, "exit") ?? 0.0) == 0.0;
       }
-      out.push(tool_finished(id.as_str(), ok, str_of(state, "output") ?? ""));
+      out.push(tool_finished(id, ok, str_of(state, "output") ?? ""));
     }
   } else if (kind == "step_finish") {
     if (let part = get(line, "part")) {

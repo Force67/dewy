@@ -1,0 +1,178 @@
+// tmux owns a small supervisor, which owns the agent's process group.
+// The network worker can disappear without closing the agent's output.
+module worker::tmux;
+
+import {String, from_str} from akikit::strings::string;
+import {object, array, set, push, text, number, parse, to_string, get, as_array, as_str} from akikit::text::json;
+import {read_file, write_file, path_exists} from akikit::filesystem::file_util;
+import {executable_path} from akikit::filesystem::common_directory_providers;
+import {join} from akikit::filesystem::path;
+import {split} from akikit::strings::string_util;
+import {set_environment_variable} from akikit::process::environment_variables;
+import {starts_with, split_once, trim} from akikit::strings::string_search;
+import {parse_i32} from akikit::strings::string_to_number;
+import {sha256, digest_to_hex} from akikit::hashing::sha256;
+import {Command, spawn_error_message, exit_code, send_signal, kSignalTerminate, kSignalKill} from akikit::process::child;
+import {milliseconds, seconds, sleep, now} from akikit::time::time;
+import {str_of, num_of} from wire::fields;
+import {Invocation, command_of} from worker::invocation;
+import {output_of} from worker::command;
+import {key} from worker::store;
+import {atomic_write} from wire::files;
+import {alive, process_start} from worker::terminal;
+import {private_temp} from worker::turn;
+import {rollout_of, last_total} from worker::codex;
+import {open_tail} from worker::tail;
+
+extern("clearenv") fn c_clearenv(): i32;
+
+// A short socket path also works when the state directory has a long name.
+pub fn socket_path(data_dir: str): String {
+  let hash = digest_to_hex(sha256(from_str(data_dir).as_bytes()));
+  var name = from_str("tmux-");
+  name.push_str(hash.as_str()[..24]);
+  return join(private_temp().as_str(), name);
+}
+
+pub fn session_name(task: str, turn: str): String {
+  return f"dewy-{key(task)}-{key(turn)}";
+}
+
+fn tmux(socket: str, arguments: str...): Command {
+  var c = Command("tmux");
+  for (let arg in ["-S", socket, "-f", "/dev/null"]) { c.arg(arg); }
+  for (let arg in arguments) { c.arg(arg); }
+  return c;
+}
+
+pub fn available(): bool {
+  var c = Command("tmux"); c.arg("-V");
+  return output_of(c) != none;
+}
+
+pub fn exists(socket: str, session: str): bool {
+  var c = tmux(socket, "has-session", "-t", f"={session}");
+  return output_of(c) != none;
+}
+
+// Save the exact invocation before launching, including the starting
+// session and Codex token baseline. Recovery never starts a launched turn twice.
+pub fn launch(socket: str, session: str, dir: str, project: str, input: str,
+              stop: str, invocation&: Invocation): bool {
+  var c = tmux(socket, "new-session", "-d", "-s", session, "-c", project);
+  // A long-lived tmux server otherwise retains the environment of the
+  // first worker. Copy this worker's environment for each new turn.
+  let env = read_file("/proc/self/environ") else { return false; };
+  var environment = array();
+  for (let entry in split(env, "\0")) {
+    if (#entry > 0 && !starts_with(entry, "TMUX=") && !starts_with(entry, "TMUX_PANE=")) {
+      push(environment, text(entry));
+    }
+  }
+  let exe = executable_path() else { return false; };
+  for (let arg in [exe.as_str(), "__dewy-run", dir]) { c.arg(arg); }
+  var j = object();
+  var args = array();
+  for (let a in invocation.args) { push(args, text(a)); }
+  set(j, "args", args);
+  set(j, "environment", environment);
+  set(j, "project", text(project)); set(j, "input", text(input)); set(j, "stop", text(stop));
+  if (let _ = atomic_write(join(dir, "launch.json"), to_string(j))) {} else { return false; }
+  return output_of(c) != none;
+}
+
+pub fn close_session(socket: str, session: str) {
+  var c = tmux(socket, "kill-session", "-t", f"={session}");
+  let _ = output_of(c);
+}
+
+pub fn result(dir: str): i32? {
+  let body = read_file(join(dir, "exit").as_str()) else { return none; };
+  return parse_i32(trim(body));
+}
+
+fn finish(dir: str, code: i32): i32 {
+  // Seal Codex's final total before releasing the next turn. Replaying
+  // this turn must never charge tokens from later turns in its session.
+  if (var output = open_tail(join(dir, "output.jsonl").as_str())) {
+    while (let line = output.next_line()) {
+      if (let j = parse(line)) {
+        if ((str_of(j, "type") ?? "") == "thread.started") {
+          if (let path = rollout_of(str_of(j, "thread_id") ?? "")) {
+            let _ = atomic_write(join(dir, "rollout-end").as_str(), f"{last_total(path)}".as_str());
+          }
+          break;
+        }
+      }
+    }
+  }
+  let _ = atomic_write(join(dir, "exit").as_str(), f"{code}".as_str());
+  return code;
+}
+
+// Internal worker mode, run inside tmux. It performs no network I/O.
+// It writes durable JSON output, the process identity, and a final status.
+pub fn supervise(dir: str): i32 {
+  let body = read_file(join(dir, "launch.json").as_str()) else { return finish(dir, 125); };
+  let j = parse(body) else { return finish(dir, 125); };
+  let args_field& = get(j, "args") else { return finish(dir, 125); };
+  let args = as_array(args_field) else { return finish(dir, 125); };
+  if (#args == 0) { return finish(dir, 125); }
+  // This process has no threads yet. Restore the worker's launch
+  // environment privately, without putting credentials in tmux argv.
+  let environment_value& = get(j, "environment") else { return finish(dir, 125); };
+  let environment = as_array(environment_value) else { return finish(dir, 125); };
+  unsafe { if (c_clearenv() != 0) { return finish(dir, 125); } }
+  for (let entry in environment) {
+    if (let pair = split_once(as_str(entry) ?? "", '=')) {
+      unsafe { if (!set_environment_variable(pair.0, pair.1)) { return finish(dir, 125); } }
+    }
+  }
+  let stop = str_of(j, "stop") ?? "";
+  if (path_exists(stop)) { return finish(dir, 143); }
+  var invocation = Invocation(as_str(args[0]) ?? "");
+  for (let i in 1usize..#args) { invocation.arg(as_str(args[i]) ?? ""); }
+  var c = command_of(invocation);
+  c.current_dir(str_of(j, "project") ?? "");
+  c.stdin_from(str_of(j, "input") ?? "/dev/null");
+  c.stdout_to(join(dir, "output.jsonl").as_str());
+  c.stderr_to(join(dir, "stderr").as_str());
+  c.new_process_group();
+  var child = c.spawn() else (let e) {
+    let _ = write_file(join(dir, "stderr").as_str(), spawn_error_message(e));
+    return finish(dir, 127);
+  };
+  var identity = object();
+  set(identity, "pid", number(child.id() as f64));
+  set(identity, "start", text((process_start(child.id()) ?? String()).as_str()));
+  let _ = atomic_write(join(dir, "process.json").as_str(), to_string(identity).as_str());
+  while (true) {
+    if (path_exists(stop)) {
+      let _ = child.signal_group(kSignalTerminate);
+      // Do not reap the leader before the final signal: its pid cannot
+      // be reused while it is a zombie, so the group is still ours.
+      sleep(seconds(2));
+      let _ = child.signal_group(kSignalKill);
+      let _ = child.wait();
+      return finish(dir, 143);
+    }
+    if (let status = child.try_wait()) { return finish(dir, exit_code(status)); }
+    sleep(milliseconds(100));
+  }
+  return finish(dir, 125);
+}
+
+// If the tmux server or supervisor disappeared, clean up the recorded
+// agent group only after checking that the pid has not been reused.
+pub fn abandon(dir: str) {
+  let body = read_file(join(dir, "process.json").as_str()) else { return; };
+  let j = parse(body) else { return; };
+  let pid = (num_of(j, "pid") ?? 0.0) as i32;
+  let start = str_of(j, "start") ?? "";
+  if (alive(pid, start)) {
+    let _ = send_signal(-pid, kSignalTerminate);
+    let began = now();
+    while (alive(pid, start) && began.elapsed() < seconds(2)) { sleep(milliseconds(100)); }
+    if (alive(pid, start)) { let _ = send_signal(-pid, kSignalKill); }
+  }
+}

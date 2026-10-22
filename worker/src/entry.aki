@@ -9,20 +9,15 @@
 
 module worker::entry;
 
-import {String, from_str} from akibase::strings::base_string;
-import {Json, object, set, text, number} from akibase::text::json;
-import {unix_time_milliseconds} from akibase::time::time;
+import {String} from akikit::strings::string;
+import {Json, object, set, text, number} from akikit::text::json;
+import {unix_time_milliseconds} from akikit::time::time;
 import {clip} from wire::clip;
 
 // Tool output beyond this is cut; the phone shows a glimpse, not a log.
 comptime let kOutputBytes: usize = 4000;
 
-pub fn entry_id(turn: str, local: str): String {
-  var id = from_str(turn);
-  id.push_c8('.');
-  id.push_str(local);
-  return id;
-}
+pub fn entry_id(turn: str, local: str): String => f"{turn}.{local}";
 
 fn base(id: str, kind: str): Json {
   var e = object();

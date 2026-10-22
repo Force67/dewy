@@ -1,9 +1,9 @@
 module board_test;
 
-import {String} from akibase::strings::base_string;
-import {contains} from akibase::strings::string_search;
-import {parse, to_string, array, as_array} from akibase::text::json;
-import {eprintln} from akibase::logging;
+import {String} from akikit::strings::string;
+import {contains} from akikit::strings::string_search;
+import {parse, to_string, array, as_array} from akikit::text::json;
+import {eprintln} from akikit::logging;
 import {str_of} from wire::fields;
 import {Board, Refusal, kStallMillis} from orchestrator::board;
 
