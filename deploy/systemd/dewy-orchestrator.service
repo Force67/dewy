@@ -1,0 +1,19 @@
+[Unit]
+Description=Dewy orchestrator
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+Environment=DEWY_HOST=0.0.0.0 DEWY_PORT=8787 DEWY_WORKER_PORT=8788
+Environment="DEWY_DATA=%S/dewy/orchestrator"
+EnvironmentFile=%E/dewy/orchestrator.env
+ExecStart="%h/.local/lib/dewy/orchestrator" --host ${DEWY_HOST} --port ${DEWY_PORT} --worker-port ${DEWY_WORKER_PORT} --data ${DEWY_DATA}
+StateDirectory=dewy/orchestrator
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=default.target

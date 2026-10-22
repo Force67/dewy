@@ -1,0 +1,20 @@
+[Unit]
+Description=Dewy worker
+
+[Service]
+Type=exec
+WorkingDirectory=%h
+Environment="PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="XDG_STATE_HOME=%S"
+EnvironmentFile=%E/dewy/worker.env
+ExecStart="%h/.local/lib/dewy/worker"
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2
+# Only stop the network worker. Its tmux server and agent turns must survive
+# stops, crashes, and upgrades so the next worker can recover them.
+KillMode=process
+
+[Install]
+WantedBy=default.target
